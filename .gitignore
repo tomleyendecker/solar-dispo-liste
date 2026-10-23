@@ -1,0 +1,10 @@
+# Zugangsdaten und Links nie versionieren
+secrets.local.ps1
+*.secret
+.env
+
+# Logs und temporaere Dateien
+*.log
+*.log.fehler
+*.log.alt
+*.tmp
