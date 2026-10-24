@@ -149,20 +149,52 @@ function Fmt-kWp($k) { if (-not $k) { return "" }; return ([math]::Round($k, 1))
 
 # ---------- Offene Auftraege (AB, Reservierungsbestaetigung, AB aus Reservierung) ----------
 # Offen-Logik wie bei Lorenz: Vorgang und Vorgangsposition nicht erfuellt, Restmenge > 0.
+# Sage zaehlt Reservierung und die daraus erzeugte "AB (aus Res)" beide in GGBestellt - die Reservierungsmenge
+# wird dann abgezogen und die Reservierung selbst nicht mehr gelistet (die AB ersetzt sie).
+$SQL_ResAbzug = @"
+OUTER APPLY (
+    SELECT SUM(rp.MengeBasis) AS Menge FROM KHKVKBelegePositionen rp
+    INNER JOIN KHKVKBelege rk ON rk.BelID = rp.BelID AND rk.Mandant = rp.Mandant
+    WHERE rp.Mandant = p.Mandant AND rp.VorPosID = p.VorPosID AND rk.Belegart LIKE 'Reservierungsbest%'
+      AND EXISTS (SELECT 1 FROM KHKVKBelegePositionen ap INNER JOIN KHKVKBelege ak ON ak.BelID = ap.BelID AND ak.Mandant = ap.Mandant
+                  WHERE ap.Mandant = p.Mandant AND ap.VorPosID = p.VorPosID AND ak.Belegart = 'AB (aus Res)')
+) res
+CROSS APPLY (SELECT vp.GGBestellt - ISNULL(res.Menge, 0) AS Menge) soll
+"@
 $SQL_OffeneAuftraege = @"
-SELECT k.BelID, k.Belegart, CAST(k.Belegjahr AS varchar) + '-' + CAST(k.Belegnummer AS varchar) AS Beleg, k.Belegdatum,
+SELECT k.BelID, k.VorID, k.Belegart, CAST(k.Belegjahr AS varchar) + '-' + CAST(k.Belegnummer AS varchar) AS Beleg, k.Belegdatum,
        k.A0Name1, k.A0Name2, k.A0Strasse, k.A0PLZ, k.A0Ort, k.A1Name1, k.A1Strasse, k.A1PLZ, k.A1Ort,
        p.Position, p.Artikelnummer, p.Bezeichnung1 AS PosBezeichnung, p.Liefertermin,
-       (vp.GGBestellt - vp.GGGeliefert) AS Offen, a.Artikelgruppe, a.Lagerfuehrung, a.Stuecklistentyp, a.Bezeichnung1 AS ArtBezeichnung
+       (soll.Menge - vp.GGGeliefert) AS Offen, a.Artikelgruppe, a.Lagerfuehrung, a.Stuecklistentyp, a.Bezeichnung1 AS ArtBezeichnung
 FROM KHKVKBelege k
 INNER JOIN KHKVKBelegePositionen p ON p.BelID = k.BelID AND p.Mandant = k.Mandant
 INNER JOIN KHKVKVorgaengePositionen vp ON vp.VorPosID = p.VorPosID AND vp.Mandant = p.Mandant
 INNER JOIN KHKVKVorgaenge v ON v.VorID = vp.VorID AND v.Mandant = vp.Mandant
 LEFT JOIN KHKArtikel a ON a.Artikelnummer = p.Artikelnummer AND a.Mandant = p.Mandant
+$SQL_ResAbzug
 WHERE k.Mandant = $Mandant AND p.PosType = 1
   AND (k.Belegart LIKE 'Auftragsbest%' OR k.Belegart LIKE 'Reservierungsbest%' OR k.Belegart = 'AB (aus Res)')
-  AND v.GGErfuellt = 0 AND vp.GGErfuellt = 0 AND (vp.GGBestellt - vp.GGGeliefert) > 0
+  AND NOT (k.Belegart LIKE 'Reservierungsbest%' AND res.Menge IS NOT NULL)
+  AND v.GGErfuellt = 0 AND vp.GGErfuellt = 0 AND (soll.Menge - vp.GGGeliefert) > 0
 ORDER BY k.BelID, p.Position
+"@
+# Liefer-/Rechnungsstand je Auftrag ueber alle Positionen (auch die schon erledigten); {BELIDS} = Liste der BelIDs
+$SQL_AuftragStand = @"
+SELECT p.BelID, COUNT(*) AS Pos,
+       SUM(CASE WHEN vp.GGGeliefert >= soll.Menge - 0.0001 THEN 1 ELSE 0 END) AS Gel, SUM(CASE WHEN vp.GGGeliefert > 0 THEN 1 ELSE 0 END) AS GelAnf,
+       SUM(CASE WHEN vp.GGBerechnet >= soll.Menge - 0.0001 THEN 1 ELSE 0 END) AS Ber, SUM(CASE WHEN vp.GGBerechnet > 0 THEN 1 ELSE 0 END) AS BerAnf
+FROM KHKVKBelegePositionen p
+INNER JOIN KHKVKVorgaengePositionen vp ON vp.VorPosID = p.VorPosID AND vp.Mandant = p.Mandant
+$SQL_ResAbzug
+WHERE p.Mandant = $Mandant AND p.PosType = 1 AND p.BelID IN ({BELIDS}) AND soll.Menge > 0
+GROUP BY p.BelID
+"@
+# Lieferscheine und Rechnungen der Vorgaenge (fuer die Detailseite); {VORIDS} = Liste der VorIDs
+$SQL_AuftragFolgebelege = @"
+SELECT VorID, Belegart, CAST(Belegjahr AS varchar) + '-' + CAST(Belegnummer AS varchar) AS Beleg, Belegdatum
+FROM KHKVKBelege
+WHERE Mandant = $Mandant AND VorID IN ({VORIDS}) AND (Belegart LIKE '%lieferschein' OR Belegart LIKE '%rechnung' OR Belegart = 'Gutschrift')
+ORDER BY Belegdatum, BelID
 "@
 $SQL_Stuecklisten = @"
 SELECT s.Stueckliste, s.Element, s.Menge, a.Bezeichnung1 AS Bezeichnung, a.Artikelgruppe, a.Lagerfuehrung
@@ -206,7 +238,7 @@ function Get-Auftraege {
             $bsName = ([string]$r["A1Name1"]).Trim(); $bsStr = ([string]$r["A1Strasse"]).Trim(); $bsOrt = ("$($r['A1PLZ']) $($r['A1Ort'])").Trim()
             if (-not $bsStr -and -not $bsOrt) { $bsStr = ([string]$r["A0Strasse"]).Trim(); $bsOrt = ("$($r['A0PLZ']) $($r['A0Ort'])").Trim() }
             $kunde = (@(([string]$r["A0Name1"]).Trim(), ([string]$r["A0Name2"]).Trim()) | Where-Object { $_ }) -join ' '
-            $auftraege[$id] = @{ BelID = $id; Beleg = [string]$r["Beleg"]; Art = $art; Datum = $r["Belegdatum"]; Kunde = $kunde; Name1 = [string]$r["A0Name1"]
+            $auftraege[$id] = @{ BelID = $id; VorID = [string]$r["VorID"]; Stand = $null; Folgebelege = @(); Beleg = [string]$r["Beleg"]; Art = $art; Datum = $r["Belegdatum"]; Kunde = $kunde; Name1 = [string]$r["A0Name1"]
                                  Baustelle = (@($bsStr, $bsOrt) | Where-Object { $_ }) -join ', '; BaustelleName = $bsName
                                  Liefertermin = $null; kWp = 0.0; Material = (New-Object System.Collections.ArrayList); Leistungen = (New-Object System.Collections.ArrayList) }
         }
@@ -227,6 +259,18 @@ function Get-Auftraege {
             }
         } else {
             [void]$au.Material.Add(@{ Gruppe = $gName; Art = $an; Bez = $bez; Menge = $menge; Lager = ((ToNum $r["Lagerfuehrung"]) -eq -1); Aus = ''; Status = ''; Fehl = 0; EkTermin = $null })
+        }
+    }
+
+    # Liefer-/Rechnungsstand und Folgebelege (Lieferscheine, Rechnungen) je Auftrag
+    if ($auftraege.Count) {
+        foreach ($r in (Run-Query ($SQL_AuftragStand -replace '\{BELIDS\}', (@($auftraege.Keys) -join ',')) $null).Rows) {
+            $auftraege[[string]$r["BelID"]].Stand = @{ Pos = [int]$r["Pos"]; Gel = [int]$r["Gel"]; GelAnf = [int]$r["GelAnf"]; Ber = [int]$r["Ber"]; BerAnf = [int]$r["BerAnf"] }
+        }
+        $vorIds = @($auftraege.Values | ForEach-Object { $_.VorID } | Where-Object { $_ -match '^[1-9][0-9]*$' } | Select-Object -Unique)
+        if ($vorIds.Count) {
+            $folge = @((Run-Query ($SQL_AuftragFolgebelege -replace '\{VORIDS\}', ($vorIds -join ',')) $null).Rows)
+            foreach ($au in $auftraege.Values) { $au.Folgebelege = @($folge | Where-Object { [string]$_["VorID"] -eq $au.VorID }) }
         }
     }
 
@@ -336,6 +380,16 @@ function Termin-Html($tr, $mitTitel) {
     return "<div title='$(HtmlEncode $t.Titel)'><b>$zeit</b>$u $teams$titel</div>"
 }
 
+# Liefer- bzw. Rechnungsstand eines Auftrags: - (nichts), x/y Positionen, Haken (alles)
+function Stand-Html($stand, $was) {
+    if (-not $stand -or $stand.Pos -eq 0) { return "" }
+    $voll = if ($was -eq 'Gel') { $stand.Gel } else { $stand.Ber }
+    $anf  = if ($was -eq 'Gel') { $stand.GelAnf } else { $stand.BerAnf }
+    $wort = if ($was -eq 'Gel') { 'geliefert' } else { 'berechnet' }
+    if ($anf -eq 0) { return "<span class='leise' title='nichts $wort'>&ndash;</span>" }
+    if ($voll -ge $stand.Pos) { return "<span class='chip da' title='alle Positionen $wort'>&#10003;</span>" }
+    return "<span title='$voll von $($stand.Pos) Positionen vollst&auml;ndig $wort'>$voll/$($stand.Pos)</span>"
+}
 function Build-Auftraege($liste, $fehler) {
     $head = Page-Head "Solar Dispo - Offene Auftraege"
     $hinweis = if ($script:KalFehler) { "<div class='hinweisbox'>$(HtmlEncode $script:KalFehler)</div>" } else { "" }
@@ -352,11 +406,12 @@ function Build-Auftraege($liste, $fehler) {
             $lt = if ($au.Liefertermin) { $au.Liefertermin.ToString('dd.MM.yyyy') } else { "" }
             "<tr><td style='white-space:nowrap'>$montage</td>" +
             "<td style='white-space:nowrap'><span class='$artCls'>$($au.Art)</span> <a class='artlink' href='/auftrag?bel=$($au.BelID)'>$(HtmlEncode $au.Beleg)</a></td>" +
-            "<td>$(HtmlEncode $au.Kunde)</td><td>$(HtmlEncode $au.Baustelle)</td><td class='num' style='white-space:nowrap'>$(Fmt-kWp $au.kWp)</td><td style='white-space:nowrap'>$lt</td><td>$($chips -join '')</td></tr>"
+            "<td>$(HtmlEncode $au.Kunde)</td><td>$(HtmlEncode $au.Baustelle)</td><td class='num' style='white-space:nowrap'>$(Fmt-kWp $au.kWp)</td><td style='white-space:nowrap'>$lt</td>" +
+            "<td style='text-align:center'>$(Stand-Html $au.Stand 'Gel')</td><td style='text-align:center'>$(Stand-Html $au.Stand 'Ber')</td><td>$($chips -join '')</td></tr>"
         }
         $inhalt = @"
 <table id='tab'>
-<thead><tr><th>Montage</th><th>Auftrag</th><th>Kunde</th><th>Baustelle</th><th class='num'>Anlage</th><th>Liefertermin</th><th>Material</th></tr></thead>
+<thead><tr><th>Montage</th><th>Auftrag</th><th>Kunde</th><th>Baustelle</th><th class='num'>Anlage</th><th>Liefertermin</th><th>Geliefert</th><th>Berechnet</th><th>Material</th></tr></thead>
 <tbody>$($rows -join '')</tbody>
 </table>
 "@
@@ -406,6 +461,19 @@ function Build-AuftragDetail($au, $fehler) {
         "<table><thead><tr><th>Leistung</th><th class='num'>Menge</th></tr></thead><tbody>" + (($au.Leistungen | ForEach-Object { "<tr><td>$(HtmlEncode $_.Bez)</td><td class='num'>$(FmtZahl $_.Menge)</td></tr>" }) -join '') + "</tbody></table>"
     } else { "<p class='leise'>Keine Leistungen.</p>" }
     $artCls = if ($au.Art -like '*RES*') { 'art res' } else { 'art' }
+    $folge = { param($muster)
+        (@($au.Folgebelege | Where-Object { [string]$_["Belegart"] -like $muster } | ForEach-Object {
+            "$(HtmlEncode $_['Belegart']) $(HtmlEncode $_['Beleg'])$(if ($_['Belegdatum'] -is [datetime]) { ' (' + $_['Belegdatum'].ToString('dd.MM.yyyy') + ')' })"
+        })) -join ', ' }
+    $standZeile = { param($was, $muster)
+        $txt = ""
+        if ($au.Stand -and $au.Stand.Pos) {
+            $voll = if ($was -eq 'Gel') { $au.Stand.Gel } else { $au.Stand.Ber }
+            $anf  = if ($was -eq 'Gel') { $au.Stand.GelAnf } else { $au.Stand.BerAnf }
+            $txt = if ($anf -eq 0) { "nichts" } elseif ($voll -ge $au.Stand.Pos) { "<span class='chip da'>&#10003;</span> alle Positionen" } else { "$voll von $($au.Stand.Pos) Positionen" }
+        }
+        $bel = & $folge $muster
+        "$txt$(if ($bel) { "<div class='leise'>$bel</div>" })" }
     return @"
 $head
 <div class='kopf'><h1><span class='$artCls'>$($au.Art)</span> $(HtmlEncode $au.Beleg) &ndash; $(HtmlEncode $au.Kunde)</h1><div class='meta'>$(StandText)</div></div>
@@ -416,6 +484,8 @@ $head
 <tr><td>Auftragsdatum</td><td>$(if ($au.Datum -is [datetime]) { $au.Datum.ToString('dd.MM.yyyy') })</td></tr>
 <tr><td>Liefertermin</td><td>$(if ($au.Liefertermin) { $au.Liefertermin.ToString('dd.MM.yyyy') })</td></tr>
 <tr><td>Anlage</td><td>$(Fmt-kWp $au.kWp)</td></tr>
+<tr><td>Geliefert</td><td>$(& $standZeile 'Gel' '*lieferschein')</td></tr>
+<tr><td>Berechnet</td><td>$(& $standZeile 'Ber' '*rechnung')</td></tr>
 </tbody></table>
 <h2>Montagetermine</h2>
 $termine
