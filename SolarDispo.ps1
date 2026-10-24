@@ -225,12 +225,14 @@ WHERE s.Mandant = $Mandant AND s.Menge > 0
 "@
 $SQL_Bestand = "SELECT Artikelnummer, SUM(Lagerbestand) AS Bestand FROM KHKArtikelVarianten WHERE Mandant = $Mandant GROUP BY Artikelnummer"
 $SQL_OffeneBestellungen = @"
-SELECT p.Artikelnummer, (vp.GGBestellt - vp.GGGeliefert) AS Offen, p.Liefertermin
+SELECT b.BelID, CAST(b.Belegjahr AS varchar) + '-' + CAST(b.Belegnummer AS varchar) AS Beleg, b.A0Name1 AS Lieferant, b.Belegdatum,
+       p.BelPosID, p.Artikelnummer, p.Bezeichnung1 AS Bezeichnung, vp.GGBestellt AS Bestellt, (vp.GGBestellt - vp.GGGeliefert) AS Offen, p.Liefertermin
 FROM KHKEKBelege b
 INNER JOIN KHKEKBelegePositionen p ON p.BelID = b.BelID AND p.Mandant = b.Mandant
 INNER JOIN KHKEKVorgaengePositionen vp ON vp.VorPosID = p.VorPosID AND vp.Mandant = p.Mandant
 INNER JOIN KHKEKVorgaenge v ON v.VorID = vp.VorID AND v.Mandant = vp.Mandant
 WHERE b.Mandant = $Mandant AND b.Belegart = 'Bestellung' AND v.GGErfuellt = 0 AND vp.GGErfuellt = 0 AND (vp.GGBestellt - vp.GGGeliefert) > 0
+ORDER BY p.Liefertermin, b.BelID, p.BelPosID
 "@
 
 # Liest alle offenen Auftraege, ordnet Kalendertermine zu und prueft das Material.
@@ -241,9 +243,12 @@ function Get-Auftraege {
     $pos = Run-Query $SQL_OffeneAuftraege $null
     $stl = @{}; foreach ($r in (Run-Query $SQL_Stuecklisten $null).Rows) { $k = [string]$r["Stueckliste"]; if (-not $stl.ContainsKey($k)) { $stl[$k] = New-Object System.Collections.ArrayList }; [void]$stl[$k].Add($r) }
     $bestand = @{}; foreach ($r in (Run-Query $SQL_Bestand $null).Rows) { $bestand[[string]$r["Artikelnummer"]] = [double](ToNum $r["Bestand"]) }
-    $ek = @{}; foreach ($r in (Run-Query $SQL_OffeneBestellungen $null).Rows) {
+    # offene Bestellpositionen; Fuer = Auftraege, denen die Position zugeteilt wird (Einkaufsseite)
+    $ek = @{}; $script:EkPositionen = New-Object System.Collections.ArrayList
+    foreach ($r in (Run-Query $SQL_OffeneBestellungen $null).Rows) {
         $a = [string]$r["Artikelnummer"]; if (-not $ek.ContainsKey($a)) { $ek[$a] = New-Object System.Collections.ArrayList }
-        [void]$ek[$a].Add(@{ Rest = [double](ToNum $r["Offen"]); Termin = $r["Liefertermin"] })
+        $e = @{ Rest = [double](ToNum $r["Offen"]); Termin = $r["Liefertermin"]; Row = $r; Fuer = (New-Object System.Collections.ArrayList) }
+        [void]$ek[$a].Add($e); [void]$script:EkPositionen.Add($e)
     }
     $script:Bestand = $bestand; $script:EkSumme = @{}; $script:EkTermin = @{}
     foreach ($a in $ek.Keys) {
@@ -316,7 +321,7 @@ function Get-Auftraege {
                 foreach ($b in ($ek[$m.Art] | Sort-Object { if ($_.Termin -is [datetime]) { $_.Termin } else { [datetime]::MaxValue } })) {
                     if ($bedarf -le 1e-9) { break }
                     $nimm = [math]::Min($bedarf, $b.Rest); if ($nimm -le 0) { continue }
-                    $b.Rest -= $nimm; $bedarf -= $nimm; $m.EkTermin = $b.Termin
+                    $b.Rest -= $nimm; $bedarf -= $nimm; $m.EkTermin = $b.Termin; [void]$b.Fuer.Add(@{ Au = $au; Menge = $nimm })
                 }
             }
             if ($bedarf -le 1e-9) { $m.Status = 'bestellt' } else { $m.Status = 'fehlt'; $m.Fehl = $bedarf }
@@ -393,6 +398,7 @@ tr.erledigt td, tr.erledigt td a.artlink { color:#9aa0a6; }
   <a class='nav$(if ($pfad -eq '/' -or $pfad -eq '/auftrag') { ' aktiv' })' href='/'>Offene Auftr&auml;ge</a>
   <a class='nav$(if ($pfad -eq '/material') { ' aktiv' })' href='/material'>Materialbedarf</a>
   <a class='nav$(if ($pfad -eq '/angebote') { ' aktiv' })' href='/angebote'>Angebote</a>
+  <a class='nav$(if ($pfad -eq '/einkauf' -or $pfad -eq '/ek') { ' aktiv' })' href='/einkauf'>Einkauf</a>
   <a class='nav$(if ($pfad -eq '/dispo') { ' aktiv' })' href='/dispo'>Dispo</a>
   <a class='nav$(if ($pfad -eq '/bewegungen') { ' aktiv' })' href='/bewegungen'>Bewegungen</a>
 </nav>
@@ -1517,7 +1523,7 @@ function Build-Dispo($artikel, $info, $liste, $ekTab, $fehler, $zusatz, $sprung)
         if ($ekTab) {
             foreach ($r in $ekTab.Rows) {
                 $lt = $r["Liefertermin"]
-                [void]$ev.Add(@{ Typ = 'EK'; Datum = $(if ($lt -is [datetime]) { $lt.Date } else { $null }); Menge = [double](ToNum $r["Offen"]); Beleg = [string]$r["Beleg"]; Info = [string]$r["Lieferant"] })
+                [void]$ev.Add(@{ Typ = 'EK'; Datum = $(if ($lt -is [datetime]) { $lt.Date } else { $null }); Menge = [double](ToNum $r["Offen"]); Beleg = [string]$r["Beleg"]; BelID = [string]$r["BelID"]; Info = [string]$r["Lieferant"] })
             }
         }
         $sortiert = @($ev | Sort-Object @{ e = { if ($_.Datum -is [datetime]) { $_.Datum } else { [datetime]::MaxValue } } }, @{ e = { if ($_.Typ -eq 'EK') { 0 } else { 1 } } })
@@ -1571,7 +1577,7 @@ function Build-Dispo($artikel, $info, $liste, $ekTab, $fehler, $zusatz, $sprung)
                 'VS' { $badge = "<span class='$(if ($e.Au.Art -like '*RES*') { 'art res' } else { 'art' })' title='Bestandteil einer St&uuml;ckliste'>$($e.Au.Art) St&uuml;ckl.</span>" }
                 default { $badge = "<span class='badge badge-ek'>Bestellung</span>" }
             }
-            $belegZelle = if ($e.Typ -eq 'EK') { HtmlEncode $e.Beleg } else { "<a class='artlink' href='/auftrag?bel=$($e.Au.BelID)'>$(HtmlEncode $e.Beleg)</a>" }
+            $belegZelle = if ($e.Typ -eq 'EK') { "<a class='artlink' href='/ek?bel=$($e.BelID)'>$(HtmlEncode $e.Beleg)</a>" } else { "<a class='artlink' href='/auftrag?bel=$($e.Au.BelID)'>$(HtmlEncode $e.Beleg)</a>" }
             $mCss = if ($zugang) { " class='num sign-plus'" } else { " class='num sign-minus'" }
             $mTxt = if ($zugang) { "+" + (FmtZahl $m) } else { "&minus;" + (FmtZahl $m) }
             $kCss = if ($kumuliert -lt 0) { " class='num warn'" } else { " class='num'" }
@@ -2270,7 +2276,7 @@ $ChatToolsJson = @'
   "input_schema":{"type":"object","properties":{"artikelnummer":{"type":"string"}},"required":["artikelnummer"]}},
  {"name":"lagerbestand","description":"Aktueller Bestand eines Artikels je Lagerplatz. Bei Stuecklisten die Bestandteile mit ihrem Bestand.",
   "input_schema":{"type":"object","properties":{"artikelnummer":{"type":"string"}},"required":["artikelnummer"]}},
- {"name":"offene_bestellungen","description":"Offene Einkaufsbestellungen mit Lieferant, Artikel, offener Menge und Liefertermin.",
+ {"name":"offene_bestellungen","description":"Offene Einkaufsbestellungen mit Lieferant, Artikel, offener Menge, Liefertermin und fuer welche Auftraege (mit Planungstermin) die Ware gebraucht wird.",
   "input_schema":{"type":"object","properties":{
     "artikelnummer":{"type":"string"},
     "lieferant":{"type":"string","description":"Lieferantenname oder Teil davon"},
@@ -2601,7 +2607,7 @@ ORDER BY SUM(lpb.Bestand) DESC
             $lief = ChatArg $inp 'lieferant'; if ($lief) { $filter += " AND b.A0Name1 LIKE '%' + @lief + '%'"; $p['@lief'] = $lief }
             if ((ChatArg $inp 'nur_ueberfaellig') -eq 'True') { $filter += ' AND p.Liefertermin < CAST(GETDATE() AS date)' }
             $t = Run-Query @"
-SELECT TOP 120 CAST(b.Belegjahr AS varchar) + '-' + CAST(b.Belegnummer AS varchar) AS Beleg, b.A0Name1 AS Lieferant, p.Artikelnummer, p.Bezeichnung1 AS Bezeichnung,
+SELECT TOP 120 b.BelID, p.BelPosID, CAST(b.Belegjahr AS varchar) + '-' + CAST(b.Belegnummer AS varchar) AS Beleg, b.A0Name1 AS Lieferant, p.Artikelnummer, p.Bezeichnung1 AS Bezeichnung,
        (vp.GGBestellt - vp.GGGeliefert) AS Offen, p.Liefertermin
 FROM KHKEKBelege b
 INNER JOIN KHKEKBelegePositionen p ON p.BelID = b.BelID AND p.Mandant = b.Mandant
@@ -2611,8 +2617,14 @@ WHERE b.Mandant = $Mandant AND b.Belegart = 'Bestellung' AND v.GGErfuellt = 0 AN
 ORDER BY p.Liefertermin, b.Belegnummer
 "@ $p
             if ($t.Rows.Count -eq 0) { return 'Keine offenen Bestellungen fuer diese Auswahl.' }
-            $z = foreach ($r in $t.Rows) { "$(ChatDat $r['Liefertermin'])$(if ($r['Liefertermin'] -is [datetime] -and $r['Liefertermin'].Date -lt $heute) { ' (ueberfaellig)' }) | $($r['Beleg']) | $($r['Lieferant']) | $($r['Artikelnummer']) (/dispo?art=$($r['Artikelnummer'])) | $($r['Bezeichnung']) | $(FmtZahl $r['Offen'])" }
-            return "$($t.Rows.Count) offene Bestellpositionen$(if ($t.Rows.Count -ge 120) { ' (Limit 120 erreicht)' }).`nLiefertermin | Bestellung | Lieferant | Artikel (Link) | Bezeichnung | Offen`n" + ($z -join "`n")
+            $null = Chat-Auftraege
+            $fuer = @{}; foreach ($e in $script:EkPositionen) { $fuer[[string]$e.Row['BelPosID']] = $e.Fuer }
+            $z = foreach ($r in $t.Rows) {
+                $fl = $fuer[[string]$r['BelPosID']]
+                $fTxt = if ($fl -and $fl.Count) { (@($fl | ForEach-Object { "$($_.Au.Beleg) $($_.Au.Kunde) $(FmtZahl $_.Menge) (Planung $(ChatDat $_.Au.Planung))" }) -join '; ') } else { 'kein offener Auftrag (Lager)' }
+                "$(ChatDat $r['Liefertermin'])$(if ($r['Liefertermin'] -is [datetime] -and $r['Liefertermin'].Date -lt $heute) { ' (ueberfaellig)' }) | $($r['Beleg']) (/ek?bel=$($r['BelID'])) | $($r['Lieferant']) | $($r['Artikelnummer']) | $($r['Bezeichnung']) | $(FmtZahl $r['Offen']) | $fTxt"
+            }
+            return "$($t.Rows.Count) offene Bestellpositionen$(if ($t.Rows.Count -ge 120) { ' (Limit 120 erreicht)' }). Link: /einkauf (ueberfaellig: /einkauf?nur=ueberfaellig, zu spaet fuer Montage: /einkauf?nur=spaet)`nLiefertermin | Bestellung (Link) | Lieferant | Artikel | Bezeichnung | Offen | fuer Auftraege (Zuteilung wie Offene Auftraege)`n" + ($z -join "`n")
         }
         'lagerbewegungen' {
             $von = ChatDatum (ChatArg $inp 'von') $heute.AddDays(-6)
@@ -2954,6 +2966,130 @@ $ChatWidgetHtml = @'
 </script>
 '@
 
+
+# ---------- Einkauf: offene Bestellungen ----------
+# Je offene Bestellposition auch, fuer welche Auftraege die Ware gebraucht wird: gleiche Zuteilung wie auf
+# "Offene Auftraege" (Bestand zuerst, dann Bestellungen nach Liefertermin an die Auftraege nach Montage-/Liefertermin).
+# "Zu spaet" = Liefertermin liegt nach dem ersten Termin, fuer den die Position gebraucht wird.
+$SQL_EkBeleg = @"
+SELECT b.BelID, CAST(b.Belegjahr AS varchar) + '-' + CAST(b.Belegnummer AS varchar) AS Beleg, b.A0Name1 AS Lieferant, b.Belegdatum,
+       p.BelPosID, p.Position, p.Artikelnummer, p.Bezeichnung1 AS Bezeichnung, p.Liefertermin, vp.GGBestellt AS Bestellt, vp.GGGeliefert AS Geliefert
+FROM KHKEKBelege b
+INNER JOIN KHKEKBelegePositionen p ON p.BelID = b.BelID AND p.Mandant = b.Mandant
+INNER JOIN KHKEKVorgaengePositionen vp ON vp.VorPosID = p.VorPosID AND vp.Mandant = p.Mandant
+WHERE b.Mandant = $Mandant AND b.BelID = @bel AND p.PosType = 1
+ORDER BY p.BelPosID
+"@
+
+# Bewertung einer offenen Bestellposition: erster Bedarfstermin, ueberfaellig, zu spaet
+function Ek-Lage($e) {
+    $heute = (Get-Date).Date
+    $lt = $e.Row["Liefertermin"]
+    $plan = @($e.Fuer | ForEach-Object { $_.Au.Planung } | Where-Object { $_ -ne [datetime]::MaxValue } | Sort-Object)
+    $erster = if ($plan.Count) { $plan[0] } else { $null }
+    $ueberf = ($lt -is [datetime] -and $lt.Date -lt $heute)
+    $spaet = ($null -ne $erster -and ($lt -isnot [datetime] -or $lt.Date -gt $erster))
+    return @{ Erster = $erster; Ueberfaellig = $ueberf; Spaet = $spaet }
+}
+# Zelle "fuer Auftraege": erster Auftrag als Link, weitere im Tooltip
+function Ek-FuerZelle($e) {
+    if (-not $e -or -not $e.Fuer.Count) { return "<span class='leise' title='Keinem offenen Auftrag zugeteilt &ndash; f&uuml;rs Lager'>Lager</span>" }
+    $liste = @($e.Fuer | Sort-Object { $_.Au.Planung })
+    $tip = HtmlEncode ((@($liste | ForEach-Object { "$(if ($_.Au.Planung -ne [datetime]::MaxValue) { $_.Au.Planung.ToString('dd.MM.') } else { 'ohne Termin' })  $($_.Au.Beleg)  $($_.Au.Kunde): $(FmtZahl $_.Menge)" })) -join "`n")
+    $a = $liste[0].Au
+    $d = if ($a.Planung -ne [datetime]::MaxValue) { "$(Datum-Kurz $a.Planung) " } else { "" }
+    $mehr = if ($liste.Count -gt 1) { " <span class='leise'>+$($liste.Count - 1)</span>" } else { "" }
+    return "<span title='$tip'>$d<a class='artlink' href='/auftrag?bel=$($a.BelID)'>$(HtmlEncode $a.Kunde)</a>$mehr</span>"
+}
+
+function Build-Einkauf($eks, $nur, $art, $fehler) {
+    $head = Page-Head "Solar Dispo - Einkauf"
+    $heute = (Get-Date).Date
+    $inhalt = ""; $nAlle = 0; $nUeb = 0; $nSpaet = 0
+    if ($fehler) { $inhalt = "<div class='fehler'>Fehler beim Laden der Daten:<br><pre>$(HtmlEncode $fehler)</pre></div>" }
+    else {
+        $liste = @(foreach ($e in $eks) { if ($art -and [string]$e.Row["Artikelnummer"] -ne $art) { continue }; @{ E = $e; L = (Ek-Lage $e) } })
+        $nAlle = $liste.Count; $nUeb = @($liste | Where-Object { $_.L.Ueberfaellig }).Count; $nSpaet = @($liste | Where-Object { $_.L.Spaet }).Count
+        $zeige = switch ($nur) { 'ueberfaellig' { @($liste | Where-Object { $_.L.Ueberfaellig }) } 'spaet' { @($liste | Where-Object { $_.L.Spaet }) } default { $liste } }
+        if ($zeige.Count -eq 0) { $inhalt = "<p class='leise'>Keine offenen Bestellungen f&uuml;r diese Auswahl.</p>" }
+        else {
+            $rows = foreach ($x in $zeige) {
+                $r = $x.E.Row; $l = $x.L; $an = HtmlEncode $r["Artikelnummer"]
+                $lt = $r["Liefertermin"]
+                $ltTxt = if ($lt -is [datetime]) { "$(Datum-Kurz $lt) $($lt.Year)" } else { "<span class='leise'>ohne Termin</span>" }
+                if ($l.Ueberfaellig) { $ltTxt = "<span class='warn' title='$(($heute - $lt.Date).Days) Tage &uuml;berf&auml;llig'>$ltTxt</span>" }
+                $st = if ($l.Spaet) { "<span class='chip fehlt' title='Gebraucht ab $($l.Erster.ToString('dd.MM.yyyy'))'>zu sp&auml;t</span>" } else { "" }
+                "<tr><td style='white-space:nowrap'>$ltTxt</td><td><a class='artlink' href='/ek?bel=$($r['BelID'])'>$(HtmlEncode $r['Beleg'])</a></td><td>$(HtmlEncode $r['Lieferant'])</td>" +
+                "<td><a class='artlink' href='/dispo?art=$an'>$an</a></td><td>$(HtmlEncode $r['Bezeichnung'])</td>" +
+                "<td class='num'>$(FmtZahl $r['Bestellt'])</td><td class='num'><b>$(FmtZahl $r['Offen'])</b></td><td style='white-space:nowrap'>$(Ek-FuerZelle $x.E)</td><td>$st</td></tr>"
+            }
+            $inhalt = @"
+<table id='tab'>
+<thead><tr><th>Liefertermin</th><th>Bestellung</th><th>Lieferant</th><th>Artikel</th><th>Bezeichnung</th><th class='num'>Bestellt</th><th class='num'>Offen</th>
+<th title='Zuteilung wie auf &bdquo;Offene Auftr&auml;ge&ldquo;: erster Auftrag mit Montage- bzw. Liefertermin, weitere im Tooltip'>F&uuml;r Auftr&auml;ge</th><th></th></tr></thead>
+<tbody>$($rows -join '')</tbody>
+</table>
+"@
+        }
+    }
+    $artQ = if ($art) { "&amp;art=$([uri]::EscapeDataString($art))" } else { "" }
+    $knopf = { param($n, $text, $anz) $cls = if ($n -eq $nur) { 'btn' } else { 'btn btn2' }; "<a class='$cls' href='/einkauf?nur=$n$artQ'>$text ($anz)</a>" }
+    $artChip = if ($art) { "<span class='hinweisbox' style='margin:0'>Artikel <b>$(HtmlEncode $art)</b> &middot; <a href='/einkauf$(if ($nur) { "?nur=$nur" })'>alle Artikel</a></span>" } else { "" }
+    return @"
+$head
+<div class='kopf'><h1>Einkauf &ndash; offene Bestellungen</h1><div class='meta'>$(StandText) &middot; $nAlle Positionen</div></div>
+<div class='steuer'>$(& $knopf '' 'Alle' $nAlle) $(& $knopf 'ueberfaellig' '&Uuml;berf&auml;llig' $nUeb) $(& $knopf 'spaet' 'Zu sp&auml;t f&uuml;r Montage' $nSpaet)
+  <input class='suche' id='suche' placeholder='Filtern ...' onkeyup='filter()'> $artChip</div>
+$inhalt
+<script>
+function filter(){
+  var q=document.getElementById('suche').value.toLowerCase();
+  document.querySelectorAll('#tab tbody tr').forEach(function(tr){ tr.style.display = tr.innerText.toLowerCase().indexOf(q)>-1 ? '' : 'none'; });
+}
+</script>
+</body></html>
+"@
+}
+
+function Build-EkDetail($tab, $eks, $fehler) {
+    $head = Page-Head "Solar Dispo - Bestellung"
+    if ($fehler) { return "$head<div class='fehler'>Fehler beim Laden der Daten:<br><pre>$(HtmlEncode $fehler)</pre></div></body></html>" }
+    if (-not $tab -or $tab.Rows.Count -eq 0) { return "$head<p class='leise'>Bestellung nicht gefunden.</p></body></html>" }
+    $k = $tab.Rows[0]
+    $offen = @{}; foreach ($e in $eks) { $offen[[string]$e.Row["BelPosID"]] = $e }
+    $rows = foreach ($r in $tab.Rows) {
+        $soll = [double](ToNum $r["Bestellt"]); $gel = [double](ToNum $r["Geliefert"]); $rest = $soll - $gel
+        $e = $offen[[string]$r["BelPosID"]]
+        $an = HtmlEncode $r["Artikelnummer"]
+        $lt = $r["Liefertermin"]; $ltTxt = if ($lt -is [datetime]) { $lt.ToString('dd.MM.yyyy') } else { "" }
+        $st = ""
+        if ($e) {
+            $l = Ek-Lage $e
+            if ($l.Ueberfaellig) { $ltTxt = "<span class='warn'>$ltTxt</span>" }
+            if ($l.Spaet) { $st = "<span class='chip fehlt' title='Gebraucht ab $($l.Erster.ToString('dd.MM.yyyy'))'>zu sp&auml;t</span>" }
+        }
+        $fertig = $rest -le 1e-9
+        "<tr$(if ($fertig) { " class='erledigt'" })><td>$(HtmlEncode $r['Position'])</td><td><a class='artlink' href='/dispo?art=$an'>$an</a></td><td>$(HtmlEncode $r['Bezeichnung'])</td>" +
+        "<td style='white-space:nowrap'>$ltTxt</td><td class='num'>$(FmtZahl $soll)</td>$(Mengen-Zelle $gel $soll 'geliefert' $false)<td class='num'>$(if (-not $fertig) { "<b>$(FmtZahl $rest)</b>" })</td>" +
+        "<td style='white-space:nowrap'>$(if (-not $fertig) { Ek-FuerZelle $e })</td><td>$st</td></tr>"
+    }
+    $bd = $k["Belegdatum"]
+    return @"
+$head
+<div class='kopf'><h1>Bestellung $(HtmlEncode $k['Beleg']) &ndash; $(HtmlEncode $k['Lieferant'])</h1><div class='meta'>$(StandText)</div></div>
+<div class='steuer'><a class='btn btn2' href='/einkauf'>&larr; Einkauf</a></div>
+<table style='max-width:520px;margin-bottom:16px'><tbody>
+<tr><td>Lieferant</td><td>$(HtmlEncode $k['Lieferant'])</td></tr>
+<tr><td>Bestelldatum</td><td>$(if ($bd -is [datetime]) { $bd.ToString('dd.MM.yyyy') })</td></tr>
+</tbody></table>
+<table>
+<thead><tr><th>Pos.</th><th>Artikel</th><th>Bezeichnung</th><th>Liefertermin</th><th class='num'>Bestellt</th><th class='num'>Geliefert</th><th class='num'>Offen</th><th>F&uuml;r Auftr&auml;ge</th><th></th></tr></thead>
+<tbody>$($rows -join '')</tbody>
+</table>
+</body></html>
+"@
+}
+
 # ---------- Dienst ----------
 if ($MyInvocation.InvocationName -eq '.') { return }   # dot-gesourct (Test): nur Funktionen laden
 
@@ -3209,6 +3345,18 @@ ORDER BY Lagerkennung, ISNULL(Dimension1, 0), ISNULL(Dimension2, 0), ISNULL(Dime
                 } catch {}
             }
 
+        } elseif ($pfad -eq "/einkauf") {
+            $nur = Parse-Query $query "nur"; if (@('ueberfaellig', 'spaet') -notcontains $nur) { $nur = '' }
+            $art = ([string](Parse-Query $query "art")).Trim() -replace "[';]", ""
+            try { $null = Get-Auftraege; $ausgabe = Build-Einkauf $script:EkPositionen $nur $art $null }
+            catch { $ausgabe = Build-Einkauf @() $nur $art ($_.Exception.ToString()) }
+        } elseif ($pfad -eq "/ek") {
+            $bel = ([string](Parse-Query $query "bel")) -replace '[^0-9]', ''
+            try {
+                if (-not $bel) { throw "Keine Bestellung angegeben." }
+                $null = Get-Auftraege
+                $ausgabe = Build-EkDetail (Run-Query $SQL_EkBeleg @{ "@bel" = [int]$bel }) $script:EkPositionen $null
+            } catch { $ausgabe = Build-EkDetail $null @() ($_.Exception.ToString()) }
         } elseif ($pfad -eq "/datei") {
             # Datei aus der Sage-Sammelmappe ausliefern - nur Pfade, die in KHKSammelmappen stehen
             $dId = 0; [void][int]::TryParse(((Parse-Query $query "id") -replace '[^0-9]', ''), [ref]$dId)
