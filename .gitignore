@@ -8,3 +8,7 @@ secrets.local.ps1
 *.log.fehler
 *.log.alt
 *.tmp
+
+# Assistent: Fragen und Bewertungen der Nutzer
+chat-protokoll.jsonl
+chat-bewertungen.jsonl

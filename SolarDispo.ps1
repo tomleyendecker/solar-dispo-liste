@@ -16,6 +16,7 @@
 #>
 
 # ---------- Konfiguration ----------
+$StartVariablen = @(Get-Variable -Scope Script | ForEach-Object { $_.Name })   # alles danach bekommt auch der Chat-Runspace
 $Port     = 8082
 $Server   = "192.168.200.226\SAGEOL"
 $Database = "LeyendeckerSolar"
@@ -35,6 +36,16 @@ $MaterialGruppen = [ordered]@{
     '64' = 'Wallbox'; '70' = 'Elektro'; '40' = 'Mini-PV'
 }
 $LeistungsGruppen = @('12', '14', '72', '80', '82', '90')   # Dachmontage, Elektromontage, Geruest, Sonstiges, Foerderung, Zuschlaege
+
+# ---- Assistent (Chat) ----
+# API-Schluessel als Umgebungsvariable ANTHROPIC_API_KEY (Benutzer oder Maschine) auf dem Server,
+# wird bei jeder Anfrage frisch gelesen. Ohne Schluessel wird das Chatfenster nicht angezeigt.
+$ChatModell    = "claude-sonnet-5-5"
+$ChatMaxRunden = 8      # max. Werkzeug-Runden je Frage
+$ChatProtokollPfad = Join-Path $PSScriptRoot "chat-protokoll.jsonl"    # je Frage eine JSON-Zeile (ohne Antwort)
+$ChatBewertungPfad = Join-Path $PSScriptRoot "chat-bewertungen.jsonl"  # Daumen hoch/runter inkl. Frage, Antwort, Kommentar
+# $false = Testbetrieb: Chat nur in Browsern, die einmal /chat-an aufgerufen haben (Cookie). $true = fuer alle.
+$ChatFuerAlle  = $true
 
 # ---------- Hilfsfunktionen ----------
 function Run-Query($sqlText, $params) {
@@ -385,6 +396,7 @@ tr.erledigt td, tr.erledigt td a.artlink { color:#9aa0a6; }
   <a class='nav$(if ($pfad -eq '/dispo') { ' aktiv' })' href='/dispo'>Dispo</a>
   <a class='nav$(if ($pfad -eq '/bewegungen') { ' aktiv' })' href='/bewegungen'>Bewegungen</a>
 </nav>
+$(if (Test-ChatErlaubt) { $ChatWidgetHtml })
 "@
 }
 
@@ -2208,8 +2220,766 @@ document.addEventListener('click', function (e) { if (!e.target.closest('.autobo
 "@
 }
 
+
+# ============================================================
+#  ASSISTENT (Chat mit Zugriff auf die Sage-Daten) - aus der Oezer-Liste uebernommen
+# ============================================================
+# Ablauf: Browser schickt den Gespraechsverlauf an POST /api/chat -> Hintergrund-Runspace
+# fragt das Modell (Anthropic Messages API) mit festen Werkzeugen. Das Modell liest Sage nur
+# ueber diese Werkzeuge (dieselben Abfragen wie die Seiten, kein freies SQL, keine Preise).
+# Der Browser fragt den Stand per GET /api/chat?id=... ab, damit der (einthreadige)
+# Webserver waehrend der Antwortzeit nicht blockiert.
+
+$ChatSystemPrompt = @'
+Du bist der Assistent der Solar Dispo Liste von Leyendecker Solar (Planung und Montage von Photovoltaikanlagen mit Speichern und Wallboxen). Du beantwortest Fragen von Projektleitung, Montageplanung, Lager und Einkauf zu Kundenauftraegen, Montageterminen, Material, Lagerbestaenden und Bestellungen. Datenquelle sind die Sage-Warenwirtschaft und der Montagekalender - du erreichst sie NUR ueber die Werkzeuge.
+
+Regeln:
+- Nenne nur Zahlen und Fakten aus Werkzeugergebnissen. Erfinde nichts. Wenn die Werkzeuge etwas nicht hergeben, sag das offen und nenne, welche Seite der Solar Dispo Liste weiterhelfen koennte.
+- Keine Preise, Betraege oder Werte - die Werkzeuge liefern bewusst keine.
+- Wird ein Artikel nur beschrieben (nicht per Nummer genannt), zuerst artikel_suchen. Bei mehreren passenden Treffern kurz die Kandidaten nennen und nachfragen, statt zu raten.
+- Antworte auf Deutsch mit korrekten Umlauten, kurz und konkret. Zuerst die Antwort in ein bis zwei Saetzen, dann bei Bedarf Details als kurze Liste. Tabellen nur wenn wirklich hilfreich (max. 6 Spalten). Datum als TT.MM.JJJJ.
+- Verlinke passende Seiten als Markdown-Links mit den relativen Pfaden aus den Werkzeugergebnissen (Zeilen "Link:" oder Pfade in Klammern), z.B. [2026-40147](/auftrag?bel=9612). Keine externen Links.
+- Du kannst nur lesen. Buchungen, Aenderungen, Termine oder Bestellungen kannst du nicht ausfuehren.
+
+Begriffe: AB = Auftragsbestaetigung, RES = Reservierungsbestaetigung (zaehlt wie ein Auftrag), AB/RES = AB aus einer Reservierung. Montagetermine stehen im Online-Kalender (Titel = Kundenname, Kategorie = Monteur/Team) und werden den Auftraegen ueber den Namen zugeordnet; "unsicher" heisst, nur der Nachname passt - dann darauf hinweisen. Planungstermin eines Auftrags = naechster Montagetermin, sonst der Liefertermin. Material-Status: da = aus Lagerbestand gedeckt, bestellt = durch eine offene Bestellung gedeckt (mit Liefertermin), fehlt = weder Bestand noch Bestellung, kein Lagerartikel = wird je Auftrag beschafft (z.B. Montagesystem LORENZ). Bestand und Bestellungen werden den Auftraegen in der Reihenfolge ihrer Planungstermine zugeteilt. Stueckliste = Set (z.B. Speicher), dessen Bestand und Bedarf ueber die Bestandteile laufen. kWp = Anlagenleistung aus den Modulpositionen. Geliefert/berechnet = wie viele Positionen eines Auftrags schon geliefert bzw. in Rechnung gestellt sind.
+
+Heute ist {DATUM}.
+'@
+
+$ChatToolsJson = @'
+[
+ {"name":"artikel_suchen","description":"Sucht aktive Artikel nach Artikelnummer oder Bezeichnung (alle Suchwoerter muessen vorkommen). Nutzen, wenn der Nutzer einen Artikel beschreibt oder die Nummer unsicher ist.",
+  "input_schema":{"type":"object","properties":{"suchtext":{"type":"string","description":"Nummer, Nummernteil oder Woerter aus der Bezeichnung, z.B. 'BYD 5.1' oder 'Fronius Symo 10'"}},"required":["suchtext"]}},
+ {"name":"offene_auftraege","description":"Offene Kundenauftraege mit naechstem Montagetermin (Team), Liefertermin, Anlagengroesse, Liefer-/Rechnungsstand und Materialstatus je Gruppe (Module, Montagesystem, WR & Speicher, Wallbox, Elektro). Sortiert nach Planungstermin. Fuer Fragen wie: was steht als naechstes an, bei welchen Auftraegen fehlt Material, wie ist der Stand bei Kunde X.",
+  "input_schema":{"type":"object","properties":{
+    "kunde":{"type":"string","description":"Kundenname oder Teil davon"},
+    "beleg":{"type":"string","description":"Auftragsnummer, Format JJJJ-Nummer, z.B. 2026-40147"},
+    "planung_bis":{"type":"string","description":"nur Auftraege mit Planungstermin (Montage oder Liefertermin) bis einschliesslich JJJJ-MM-TT"},
+    "nur_mit_fehlendem_material":{"type":"boolean"}}}},
+ {"name":"auftrag","description":"Alle Details eines Auftrags: Kunde, Baustelle, alle Montagetermine, jede Material- und Leistungsposition mit Menge, geliefert, berechnet und Status, Lieferscheine und Rechnungen.",
+  "input_schema":{"type":"object","properties":{"beleg":{"type":"string","description":"Auftragsnummer JJJJ-Nummer"},"kunde":{"type":"string","description":"alternativ Kundenname, wenn die Nummer unbekannt ist"}}}},
+ {"name":"materialbedarf","description":"Was fehlt fuer die anstehenden Auftraege: je Lagerartikel fehlende Menge, Bestand, offene Bestellmenge mit fruehestem Liefertermin und der erste betroffene Auftrag. Dazu die Positionen ohne Lagerfuehrung, die je Auftrag beschafft werden muessen (z.B. Montagesystem).",
+  "input_schema":{"type":"object","properties":{"tage":{"type":"integer","description":"nur Auftraege mit Planungstermin bis heute plus N Tage, Standard 28; 0 = alle"}}}},
+ {"name":"montagetermine","description":"Termine aus dem Montagekalender in einem Zeitraum mit Team/Monteur und dem zugeordneten Auftrag. Fuer Fragen wie: wer ist naechste Woche wo, welche Montagen hat Danny, wann wird bei Kunde X montiert.",
+  "input_schema":{"type":"object","properties":{
+    "von":{"type":"string","description":"JJJJ-MM-TT, Standard heute"},
+    "bis":{"type":"string","description":"JJJJ-MM-TT, Standard heute + 7 Tage"},
+    "team":{"type":"string","description":"Name des Monteurs/Teams oder Teil davon"},
+    "text":{"type":"string","description":"Text im Termintitel, z.B. Kundenname"}}}},
+ {"name":"artikel_dispo","description":"Disposition eines Artikels: Lagerbestand und alle offenen Bedarfe (Auftraege mit Montage-/Liefertermin) und Zugaenge (Bestellungen) in Terminreihenfolge mit kumuliertem Bestand und Deckung. Bei Stuecklisten (z.B. Speicher-Sets) die Auftraege mit Status der Bestandteile. Fuer Fragen wie: reicht der Bestand, wann kommt Nachschub, wer braucht den Artikel.",
+  "input_schema":{"type":"object","properties":{"artikelnummer":{"type":"string"}},"required":["artikelnummer"]}},
+ {"name":"lagerbestand","description":"Aktueller Bestand eines Artikels je Lagerplatz. Bei Stuecklisten die Bestandteile mit ihrem Bestand.",
+  "input_schema":{"type":"object","properties":{"artikelnummer":{"type":"string"}},"required":["artikelnummer"]}},
+ {"name":"offene_bestellungen","description":"Offene Einkaufsbestellungen mit Lieferant, Artikel, offener Menge und Liefertermin.",
+  "input_schema":{"type":"object","properties":{
+    "artikelnummer":{"type":"string"},
+    "lieferant":{"type":"string","description":"Lieferantenname oder Teil davon"},
+    "nur_ueberfaellig":{"type":"boolean","description":"nur Bestellungen mit Liefertermin vor heute"}}}},
+ {"name":"lagerbewegungen","description":"Protokoll der Lagerbuchungen: wer hat wann welchen Artikel von welchem Lagerplatz wohin gebucht (Wareneingang, Lieferung an Kunde, Umbuchung, Inventur), mit Lieferschein und Kunde bzw. Wareneingang und Lieferant. Neueste zuerst, max. 150 Zeilen. Sage speichert nur das Datum.",
+  "input_schema":{"type":"object","properties":{
+    "von":{"type":"string","description":"JJJJ-MM-TT, Standard: vor 7 Tagen"},
+    "bis":{"type":"string","description":"JJJJ-MM-TT, Standard: heute"},
+    "artikelnummer":{"type":"string","description":"Artikelnummer (Anfang) oder Text aus der Bezeichnung"},
+    "lager":{"type":"string","description":"Lagerkennung oder Platz, z.B. A, A 1/2/3, Warenlager"},
+    "person":{"type":"string","description":"Name der Person"},
+    "art":{"type":"string","enum":["um","zu","ab"],"description":"um = Umbuchungen, zu = Zugaenge, ab = Entnahmen"}}}},
+ {"name":"lagerplatz_inhalt","description":"Welche Artikel mit welchem Bestand auf Lagerplaetzen liegen, deren Lagerkennung so beginnt (oder genau auf einem Platz wie A 1/2/3).",
+  "input_schema":{"type":"object","properties":{"lager":{"type":"string","description":"Lagerkennung oder Platz, z.B. A, A 1/2, Warenlager"}},"required":["lager"]}}
+]
+'@
+
+# JSON-Serialisierung ohne die Eigenheiten von ConvertTo-Json in PS 5.1 (einelementige
+# Arrays, leere Objekte). Nicht-ASCII wird als \uXXXX geschrieben.
+function ConvertTo-JsonText($o) {
+    if ($null -eq $o -or $o -is [System.DBNull]) { return 'null' }
+    if ($o -is [string] -or $o -is [char]) {
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.Append('"')
+        foreach ($ch in ([string]$o).ToCharArray()) {
+            $c = [int]$ch
+            if ($ch -eq '"') { [void]$sb.Append('\"') }
+            elseif ($ch -eq '\') { [void]$sb.Append('\\') }
+            elseif ($c -eq 10) { [void]$sb.Append('\n') }
+            elseif ($c -eq 13) { [void]$sb.Append('\r') }
+            elseif ($c -eq 9) { [void]$sb.Append('\t') }
+            elseif ($c -lt 32 -or $c -gt 126) { [void]$sb.Append('\u').Append($c.ToString('x4')) }
+            else { [void]$sb.Append($ch) }
+        }
+        [void]$sb.Append('"')
+        return $sb.ToString()
+    }
+    if ($o -is [bool]) { if ($o) { return 'true' } else { return 'false' } }
+    if ($o -is [datetime]) { return '"' + $o.ToString('yyyy-MM-ddTHH:mm:ss') + '"' }
+    if ($o -is [int] -or $o -is [long] -or $o -is [int16] -or $o -is [byte] -or $o -is [decimal] -or $o -is [double] -or $o -is [single]) {
+        return ([System.IConvertible]$o).ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($o -is [System.Collections.IDictionary]) {
+        $teile = foreach ($k in $o.Keys) { (ConvertTo-JsonText ([string]$k)) + ':' + (ConvertTo-JsonText $o[$k]) }
+        return '{' + ($teile -join ',') + '}'
+    }
+    if ($o -is [System.Management.Automation.PSCustomObject]) {
+        $teile = foreach ($p in $o.PSObject.Properties) { (ConvertTo-JsonText $p.Name) + ':' + (ConvertTo-JsonText $p.Value) }
+        return '{' + ($teile -join ',') + '}'
+    }
+    if ($o -is [System.Collections.IEnumerable]) {
+        $teile = foreach ($x in $o) { ConvertTo-JsonText $x }
+        return '[' + ($teile -join ',') + ']'
+    }
+    return ConvertTo-JsonText ([string]$o)
+}
+
+function Get-ChatApiKey {
+    foreach ($ziel in 'Process', 'User', 'Machine') {
+        $k = [Environment]::GetEnvironmentVariable('ANTHROPIC_API_KEY', $ziel)
+        if (-not [string]::IsNullOrWhiteSpace($k)) { return $k.Trim() }
+    }
+    return $null
+}
+
+# Chat fuer diese Anfrage anzeigen/erlauben? (Schluessel vorhanden + ggf. Testfreigabe per Cookie)
+function Test-ChatErlaubt {
+    if ($null -eq $ChatPool) { return $false }
+    if ($null -eq $script:ChatKeyGeprueft -or ((Get-Date) - $script:ChatKeyGeprueft).TotalSeconds -gt 60) {
+        $script:ChatKeyVorhanden = [bool](Get-ChatApiKey); $script:ChatKeyGeprueft = Get-Date
+    }
+    if (-not $script:ChatKeyVorhanden) { return $false }
+    if ($ChatFuerAlle) { return $true }
+    $ck = $request.Cookies['solarchat']
+    return ($null -ne $ck -and $ck.Value -eq '1')
+}
+
+# ---- Werkzeuge ----
+function ChatArg($inp, $name) {
+    if ($null -eq $inp) { return '' }
+    $p = $inp.PSObject.Properties[$name]
+    if ($null -eq $p -or $null -eq $p.Value) { return '' }
+    return ([string]$p.Value).Trim()
+}
+function ChatDat($d) { if ($d -is [datetime] -and $d -ne [datetime]::MaxValue) { return $d.ToString('dd.MM.yyyy') } else { return '-' } }
+function ChatDatum($s, $standard) {
+    $d = [datetime]::MinValue
+    if ([datetime]::TryParseExact([string]$s, 'yyyy-MM-dd', $null, 'None', [ref]$d)) { return $d }
+    return $standard
+}
+function ChatKuerzen($text, $max) {
+    if ($text.Length -le $max) { return $text }
+    return $text.Substring(0, $max) + "`n... (gekuerzt)"
+}
+function ChatText($s) { return [System.Net.WebUtility]::HtmlDecode([string]$s) }
+# Offene Auftraege fuer die Werkzeuge: innerhalb einer Frage nur einmal laden (60 s)
+function Chat-Auftraege {
+    if ($null -eq $script:ChatAuZeit -or ((Get-Date) - $script:ChatAuZeit).TotalSeconds -gt 60) {
+        $script:ChatAu = @(Get-Auftraege); $script:ChatAuZeit = Get-Date
+    }
+    return $script:ChatAu
+}
+function ChatTermin($tr) {
+    if (-not $tr) { return 'kein Montagetermin' }
+    $t = $tr.T
+    $zeit = if ($t.Ende.Date -gt $t.Start.Date) { "$($t.Start.ToString('dd.MM.yyyy'))-$($t.Ende.ToString('dd.MM.yyyy'))" } else { $t.Start.ToString('dd.MM.yyyy') }
+    return "$zeit ($(@($t.Team) -join ', '))$(if (-not $tr.Sicher) { ' [unsicher zugeordnet]' })"
+}
+function ChatMatStatus($m) {
+    switch ($m.Status) {
+        'da' { 'da' }
+        'bestellt' { "bestellt$(if ($m.EkTermin -is [datetime]) { ' Liefertermin ' + $m.EkTermin.ToString('dd.MM.yyyy') + $(if ($m.EkTermin.Date -lt (Get-Date).Date) { ' (ueberfaellig)' }) })" }
+        'fehlt' { "fehlt $(FmtZahl $m.Fehl)" }
+        default { 'kein Lagerartikel' }
+    }
+}
+function ChatStand($st, $was) {
+    if (-not $st -or -not $st.Pos) { return '-' }
+    $voll = if ($was -eq 'Gel') { $st.Gel } else { $st.Ber }; $anf = if ($was -eq 'Gel') { $st.GelAnf } else { $st.BerAnf }
+    if ($anf -eq 0) { return 'nichts' }
+    if ($voll -ge $st.Pos) { return 'alles' }
+    return "$voll/$($st.Pos) Pos."
+}
+function ChatAuftragFinden($liste, $beleg, $kunde) {
+    if ($beleg) { return @($liste | Where-Object { $_.Beleg -eq $beleg }) }
+    if ($kunde) { return @($liste | Where-Object { $_.Kunde -like "*$kunde*" -or $_.BaustelleName -like "*$kunde*" }) }
+    return @()
+}
+
+# SQL-Bedingung fuer eine Lagerangabe. "A 4/2/2" = Lagerkennung "A" mit Dimensionen 4/2/2 (so zeigt
+# Fmt-Platz die Plaetze an); sonst Anfang der Lagerkennung. Ist der ganze Text eine Lagerkennung, gilt er als solche.
+# $aliase: Liste von @(AliasLagerkennung, AliasDimensionen), Bedingungen werden ODER-verknuepft.
+function ChatPlatzBedingung($lager, $aliase, $p) {
+    $exakt = $false
+    $m = $null
+    if ($lager -match '^(.+?)\s+(\d+)(?:/(\d+))?(?:/(\d+))?$') {
+        $m = $matches.Clone()
+        $istKennung = Run-Query "SELECT TOP 1 1 AS x FROM KHKLagerplaetze WHERE Mandant = $Mandant AND Lagerkennung = @k" @{ "@k" = $lager }
+        $exakt = ($istKennung.Rows.Count -eq 0)
+    }
+    if (-not $exakt) {
+        $p['@platz'] = $lager
+        return '(' + (($aliase | ForEach-Object { "$($_[0]).Lagerkennung LIKE @platz + '%'" }) -join ' OR ') + ')'
+    }
+    $p['@lk'] = $m[1]
+    $dims = @()
+    for ($i = 2; $i -le 4; $i++) { if ($m[$i]) { $p["@d$($i - 1)"] = [int]$m[$i]; $dims += $i - 1 } }
+    return '(' + (($aliase | ForEach-Object {
+        $a = $_
+        "($($a[0]).Lagerkennung = @lk" + (($dims | ForEach-Object { " AND $($a[1]).Dimension$_ = @d$_" }) -join '') + ')'
+    }) -join ' OR ') + ')'
+}
+
+function Invoke-ChatTool($name, $inp) {
+    $heute = (Get-Date).Date
+    switch ($name) {
+        'artikel_suchen' {
+            $worte = @((ChatArg $inp 'suchtext') -split '\s+' | Where-Object { $_ -ne '' } | Select-Object -First 5)
+            if ($worte.Count -eq 0) { return 'Kein Suchtext angegeben.' }
+            $p = @{}; $bed = for ($i = 0; $i -lt $worte.Count; $i++) {
+                $p["@w$i"] = "%$($worte[$i])%"; "(Artikelnummer LIKE @w$i OR Bezeichnung1 LIKE @w$i OR ISNULL(Bezeichnung2,'') LIKE @w$i)"
+            }
+            $t = Run-Query "SELECT TOP 25 Artikelnummer, Bezeichnung1, Stuecklistentyp, Lagerfuehrung FROM KHKArtikel WHERE Mandant = $Mandant AND Aktiv = -1 AND $($bed -join ' AND ') ORDER BY Artikelnummer" $p
+            if ($t.Rows.Count -eq 0) { return "Keine aktiven Artikel gefunden fuer: $($worte -join ' ')" }
+            $z = foreach ($r in $t.Rows) { "$($r['Artikelnummer']) | $($r['Bezeichnung1'])$(if ((ToNum $r['Stuecklistentyp']) -eq 2) { ' | Stueckliste' } elseif ((ToNum $r['Lagerfuehrung']) -ne -1) { ' | kein Lagerartikel' })" }
+            return "Artikelnummer | Bezeichnung ($($t.Rows.Count) Treffer, max. 25). Dispo je Artikel: /dispo?art=<Nummer>`n" + ($z -join "`n")
+        }
+        'offene_auftraege' {
+            $liste = Chat-Auftraege
+            $kunde = ChatArg $inp 'kunde'; $beleg = ChatArg $inp 'beleg'
+            $bis = ChatDatum (ChatArg $inp 'planung_bis') $null
+            $nurFehlt = (ChatArg $inp 'nur_mit_fehlendem_material') -eq 'True'
+            $treffer = @($liste | Where-Object {
+                (-not $kunde -or $_.Kunde -like "*$kunde*" -or $_.BaustelleName -like "*$kunde*") -and (-not $beleg -or $_.Beleg -eq $beleg) -and
+                (-not $bis -or $_.Planung -le $bis) -and (-not $nurFehlt -or @($_.Material | Where-Object { $_.Status -eq 'fehlt' }).Count)
+            })
+            if ($treffer.Count -eq 0) { return "Keine offenen Auftraege fuer diese Auswahl ($($liste.Count) offene Auftraege insgesamt)." }
+            $gruppen = @($MaterialGruppen.Values | Select-Object -Unique) + 'Sonstiges'
+            $z = foreach ($au in ($treffer | Select-Object -First 60)) {
+                $mat = foreach ($g in $gruppen) {
+                    $zl = @($au.Material | Where-Object { $_.Gruppe -eq $g }); if (-not $zl.Count) { continue }
+                    $f = @($zl | Where-Object { $_.Status -eq 'fehlt' }); $b = @($zl | Where-Object { $_.Status -eq 'bestellt' })
+                    $gt = ChatText $g
+                    if ($f.Count) { "$gt FEHLT (" + (($f | ForEach-Object { "$($_.Art) $($_.Bez) fehlt $(FmtZahl $_.Fehl)" }) -join '; ') + ')' }
+                    elseif ($b.Count) { "$gt bestellt (" + (($b | ForEach-Object { "$($_.Art) $(ChatMatStatus $_)" }) -join '; ') + ')' }
+                    elseif (@($zl | Where-Object { $_.Status -eq 'da' }).Count) { "$gt da" } else { "$gt kein Lagerartikel" }
+                }
+                "$(ChatTermin $au.Naechster) | $($au.Art) $($au.Beleg) (/auftrag?bel=$($au.BelID)) | $($au.Kunde) | $($au.Baustelle) | $(if ($au.kWp) { [math]::Round($au.kWp, 1) }) | $(ChatDat $au.Liefertermin) | $(ChatStand $au.Stand 'Gel') | $(ChatStand $au.Stand 'Ber') | $(@($mat) -join ', ')"
+            }
+            return "$($treffer.Count) offene Auftraege$(if ($treffer.Count -gt 60) { ', die ersten 60' }), sortiert: zuerst mit kommendem Montagetermin, dann nach Liefertermin. Link Liste: /`nNaechster Montagetermin (Team) | Auftrag (Link) | Kunde | Baustelle | kWp | Liefertermin | geliefert | berechnet | Material`n" + ($z -join "`n")
+        }
+        'auftrag' {
+            $liste = Chat-Auftraege
+            $tr = @(ChatAuftragFinden $liste (ChatArg $inp 'beleg') (ChatArg $inp 'kunde'))
+            if ($tr.Count -eq 0) { return 'Kein offener Auftrag gefunden (abgeschlossene Auftraege sind nicht enthalten). Tipp: offene_auftraege mit Kundenname.' }
+            if ($tr.Count -gt 1) { return "Mehrere offene Auftraege passen: " + (($tr | ForEach-Object { "$($_.Beleg) $($_.Kunde)" }) -join '; ') + '. Bitte Auftragsnummer angeben.' }
+            $au = $tr[0]
+            $pos = Get-AuftragPositionen $au
+            $termine = if ($au.Termine.Count) { ($au.Termine | ForEach-Object { "- $(ChatTermin $_)$(if ($_.T.Ende.Date -lt $heute) { ' (vergangen)' }): $($_.T.Titel)" }) -join "`n" } else { '- keine Kalendertermine gefunden' }
+            $mat = foreach ($m in $pos.Material) {
+                $fertig = $m.Gel -ge $m.Soll - 1e-9
+                $st = if ($fertig) { 'geliefert' } elseif (-not $m.Lager) { 'kein Lagerartikel' } elseif ($m.Offen) { ChatMatStatus $m.Offen } else { '-' }
+                "$(ChatText $m.Gruppe) | $($m.Art) | $($m.Bez)$(if ($m.Aus) { " (aus $($m.Aus))" }) | $(FmtZahl $m.Soll) | $(FmtZahl $m.Gel) | $(FmtZahl $m.Ber) | $st"
+            }
+            $lei = foreach ($l in $pos.Leistungen) { "$($l.Bez) | $(FmtZahl $l.Soll) | $(FmtZahl $l.Gel) | $(FmtZahl $l.Ber)" }
+            $folge = (@($au.Folgebelege | ForEach-Object { "$($_['Belegart']) $($_['Beleg']) ($(ChatDat $_['Belegdatum']))" })) -join '; '
+            return "$($au.Art) $($au.Beleg) - $($au.Kunde)`nLink: /auftrag?bel=$($au.BelID)`nBaustelle: $((@($au.BaustelleName, $au.Baustelle) | Where-Object { $_ }) -join ', ')`nAuftragsdatum $(ChatDat $au.Datum), Liefertermin $(ChatDat $au.Liefertermin), Anlage $(if ($au.kWp) { [math]::Round($au.kWp, 1) } else { '-' }) kWp`nGeliefert: $(ChatStand $au.Stand 'Gel'), berechnet: $(ChatStand $au.Stand 'Ber'). Lieferscheine/Rechnungen: $(if ($folge) { $folge } else { 'keine' })`nMontagetermine:`n$termine`nMaterial: Gruppe | Artikel | Bezeichnung | Menge | geliefert | berechnet | Status`n" + ($mat -join "`n") + "`nLeistungen: Leistung | Menge | geliefert | berechnet`n" + ($lei -join "`n")
+        }
+        'materialbedarf' {
+            $liste = Chat-Auftraege
+            $tage = 28; $tv = ChatArg $inp 'tage'; if ($tv -match '^\d{1,4}$') { $tage = [int]$tv }
+            $bis = if ($tage -gt 0) { $heute.AddDays($tage) } else { [datetime]::MaxValue }
+            $art = [ordered]@{}; $ohne = New-Object System.Collections.ArrayList
+            foreach ($au in $liste) {
+                if ($au.Planung -gt $bis) { continue }
+                foreach ($m in $au.Material) {
+                    if (-not $m.Lager) { if ($m.Gruppe -ne 'Elektro') { [void]$ohne.Add("$(ChatDat $au.Planung) | $($au.Beleg) (/auftrag?bel=$($au.BelID)) $($au.Kunde) | $($m.Art) $($m.Bez) | $(FmtZahl $m.Menge)") }; continue }
+                    if ($m.Status -ne 'fehlt') { continue }
+                    if (-not $art.Contains($m.Art)) { $art[$m.Art] = @{ Bez = $m.Bez; Fehl = 0.0; Erster = $au; Anz = 0 } }
+                    $art[$m.Art].Fehl += $m.Fehl; $art[$m.Art].Anz++
+                }
+            }
+            $z = foreach ($k in $art.Keys) {
+                $a = $art[$k]; $ek = ToNum $script:EkSumme[$k]; $bst = ToNum $script:Bestand[$k]
+                "$k (/dispo?art=$k) | $($a.Bez) | fehlt $(FmtZahl $a.Fehl) | Bestand $(FmtZahl $bst) | bestellt $(if ($ek) { "$(FmtZahl $ek) ab $(ChatDat $script:EkTermin[$k])" } else { '-' }) | erster: $(ChatDat $a.Erster.Planung) $($a.Erster.Beleg) $($a.Erster.Kunde) | $($a.Anz) Auftraege"
+            }
+            $zeitraum = if ($tage -gt 0) { "Auftraege mit Planungstermin bis $($bis.ToString('dd.MM.yyyy'))" } else { 'alle offenen Auftraege' }
+            return "$zeitraum. Link: /material?nur=fehlt&tage=$(if (@(14, 28, 0) -contains $tage) { $tage } else { 28 })`nFehlende Lagerartikel ($($art.Count)): Artikel | Bezeichnung | fehlt | Bestand | offene Bestellung | erster Auftrag | Anzahl`n" + $(if ($art.Count) { $z -join "`n" } else { 'keine' }) +
+                   "`nOhne Lagerfuehrung, je Auftrag zu beschaffen ($($ohne.Count)): Planung | Auftrag | Artikel | Menge`n" + $(if ($ohne.Count) { (@($ohne) | Select-Object -First 60) -join "`n" } else { 'keine' })
+        }
+        'montagetermine' {
+            $von = ChatDatum (ChatArg $inp 'von') $heute; $bis = ChatDatum (ChatArg $inp 'bis') $heute.AddDays(7)
+            $team = ChatArg $inp 'team'; $text = ChatArg $inp 'text'
+            $termine = @(Get-Kalender | Where-Object { $_.Ende.Date -ge $von -and $_.Start.Date -le $bis -and
+                (-not $team -or (@($_.Team) -join ',') -like "*$team*") -and (-not $text -or $_.Titel -like "*$text*") } | Sort-Object Start)
+            if ($script:KalFehler) { $hinweis = "Hinweis: $($script:KalFehler)`n" } else { $hinweis = '' }
+            if ($termine.Count -eq 0) { return "$($hinweis)Keine Kalendertermine $($von.ToString('dd.MM.yyyy')) bis $($bis.ToString('dd.MM.yyyy')) fuer diese Auswahl." }
+            # Zuordnung Termin -> Auftrag (wie auf der Seite Offene Auftraege)
+            $zu = @{}
+            foreach ($au in (Chat-Auftraege)) { foreach ($tr in $au.Termine) { $zu["$($tr.T.Start.Ticks)|$($tr.T.Titel)"] = @{ Au = $au; Sicher = $tr.Sicher } } }
+            $z = foreach ($t in ($termine | Select-Object -First 120)) {
+                $zeit = if ($t.Ende.Date -gt $t.Start.Date) { "$($t.Start.ToString('ddd dd.MM.', [Globalization.CultureInfo]'de-DE'))-$($t.Ende.ToString('dd.MM.'))" } else { $t.Start.ToString('ddd dd.MM.yyyy', [Globalization.CultureInfo]'de-DE') }
+                if (-not $t.Ganztag) { $zeit += ' ' + $t.Start.ToString('HH:mm') }
+                $a = $zu["$($t.Start.Ticks)|$($t.Titel)"]
+                $auTxt = if ($a) { "$($a.Au.Beleg) (/auftrag?bel=$($a.Au.BelID))$(if (-not $a.Sicher) { ' [unsicher]' })" } else { '-' }
+                "$zeit | $(@($t.Team) -join ', ') | $($t.Titel) | $auTxt"
+            }
+            return "$hinweis$($termine.Count) Termine $($von.ToString('dd.MM.yyyy')) bis $($bis.ToString('dd.MM.yyyy'))$(if ($termine.Count -gt 120) { ', die ersten 120' }). Zugeordnet werden nur offene Auftraege.`nDatum | Team | Termin | offener Auftrag (Link)`n" + ($z -join "`n")
+        }
+        'artikel_dispo' {
+            $art = ChatArg $inp 'artikelnummer'
+            $info = Run-Query $SQL_DispoArtikel @{ "@art" = $art }
+            if ($info.Rows.Count -eq 0) { return "Artikel $art nicht gefunden. Tipp: artikel_suchen verwenden." }
+            $ir = $info.Rows[0]
+            $istHstl = (ToNum $ir['Stuecklistentyp']) -eq 2; $istLager = (ToNum $ir['Lagerfuehrung']) -eq -1
+            $bestand = ToNum $ir['Bestand']; if ($null -eq $bestand) { $bestand = 0 }
+            $kopf = "Artikel $art - $($ir['Bezeichnung'])`nLink: /dispo?art=$art"
+            $liste = Chat-Auftraege
+            $ev = New-Object System.Collections.ArrayList
+            foreach ($au in $liste) {
+                $tm = Dispo-Termin $au
+                foreach ($m in $au.Material) {
+                    if ($istHstl) { if ($m.KitArt -ne $art) { continue } }
+                    elseif ($m.Art -ne $art) { continue }
+                    [void]$ev.Add(@{ Datum = $tm.Datum; Montage = $tm.Montage; Au = $au; M = $m })
+                }
+            }
+            if ($istHstl) {
+                # je Auftrag + Position eine Zeile, schlechtester Status der Bestandteile
+                $kits = [ordered]@{}
+                foreach ($e in $ev) { $k = "$($e.Au.BelID)|$($e.M.KitPos)"; if (-not $kits.Contains($k)) { $kits[$k] = @{ E = $e; Teile = (New-Object System.Collections.ArrayList) } }; [void]$kits[$k].Teile.Add($e.M) }
+                $z = foreach ($k in $kits.Values) {
+                    $e = $k.E; $f = @($k.Teile | Where-Object { $_.Status -eq 'fehlt' }); $b = @($k.Teile | Where-Object { $_.Status -eq 'bestellt' })
+                    $st = if ($f.Count) { 'fehlt: ' + (($f | ForEach-Object { "$($_.Art) $($_.Bez) fehlt $(FmtZahl $_.Fehl)" }) -join '; ') } elseif ($b.Count) { 'bestellt: ' + (($b | ForEach-Object { "$($_.Art) $(ChatMatStatus $_)" }) -join '; ') } else { 'da' }
+                    "$(ChatDat $e.Datum)$(if ($e.Montage) { ' Montage' } else { ' Liefertermin' }) | $($e.Au.Beleg) (/auftrag?bel=$($e.Au.BelID)) | $($e.Au.Kunde) | $(FmtZahl $e.M.KitMenge) | $st"
+                }
+                $komp = Run-Query $SQL_DispoKomponenten @{ "@art" = $art }
+                $kz = foreach ($r in $komp.Rows) { "$($r['Element']) | $($r['Bezeichnung']) | $(FmtZahl $r['Menge']) je Set | Bestand $(FmtZahl $script:Bestand[[string]$r['Element']])" }
+                return "$kopf`nStueckliste (Set) ohne eigenen Bestand. Bestandteile:`n" + ($kz -join "`n") + "`nOffene Auftraege mit diesem Set ($($kits.Count)): Termin | Auftrag (Link) | Kunde | Menge | Status der Bestandteile`n" + $(if ($kits.Count) { $z -join "`n" } else { 'keine' })
+            }
+            $ekTab = Run-Query $SQL_DispoEk @{ "@art" = $art }
+            foreach ($r in $ekTab.Rows) { $lt = $r['Liefertermin']; [void]$ev.Add(@{ Datum = $(if ($lt -is [datetime]) { $lt.Date } else { $null }); EK = $r }) }
+            $sortiert = @($ev | Sort-Object @{ e = { if ($_.Datum -is [datetime]) { $_.Datum } else { [datetime]::MaxValue } } }, @{ e = { if ($_.EK) { 0 } else { 1 } } })
+            $kum = [double]$bestand; $min = $kum; $minDat = 'heute'; $fehltAb = $null
+            $z = foreach ($e in $sortiert) {
+                if ($e.EK) {
+                    $m = [double](ToNum $e.EK['Offen']); $kum += $m
+                    "$(ChatDat $e.Datum)$(if ($e.Datum -is [datetime] -and $e.Datum -lt $heute) { ' (ueberfaellig)' }) | Bestellung $($e.EK['Beleg']) | $($e.EK['Lieferant']) | +$(FmtZahl $m) | $(FmtZahl $kum) | -"
+                } else {
+                    $m = [double]$e.M.Menge; $kum -= $m
+                    if ($istLager -and $kum -lt $min) { $min = $kum; $minDat = ChatDat $e.Datum }
+                    if ($istLager -and $kum -lt 0 -and $null -eq $fehltAb) { $fehltAb = ChatDat $e.Datum }
+                    "$(ChatDat $e.Datum)$(if ($e.Montage) { ' Montage' } else { ' Liefertermin' }) | $($e.Au.Art) $($e.Au.Beleg) (/auftrag?bel=$($e.Au.BelID)) | $($e.Au.Kunde)$(if ($e.M.Aus) { " (aus Set $($e.M.Aus))" }) | -$(FmtZahl $m) | $(if ($istLager) { FmtZahl $kum } else { '-' }) | $(ChatMatStatus $e.M)"
+                }
+            }
+            $fazit = if (-not $istLager) { 'Kein Lagerartikel - wird je Auftrag beschafft.' }
+                     elseif ($null -ne $fehltAb) { "Bestand reicht NICHT: fehlt ab $fehltAb, tiefster Stand $(FmtZahl $min) am $minDat." }
+                     elseif ($sortiert.Count) { "Alle offenen Bedarfe gedeckt, tiefster Stand $(FmtZahl $min) am $minDat." } else { 'Keine offenen Bedarfe oder Bestellungen.' }
+            return "$kopf`nLagerbestand heute: $(FmtZahl $bestand)`n$fazit`nTermine vor heute sind ueberfaellig, aber noch offen.`nTermin | Beleg (Link) | Kunde/Lieferant | Menge | Kumuliert | Deckung`n" + ((@($z) | Select-Object -First 80) -join "`n") + $(if ($sortiert.Count -gt 80) { "`n... $($sortiert.Count - 80) weitere, siehe Link" })
+        }
+        'lagerbestand' {
+            $art = ChatArg $inp 'artikelnummer'
+            $info = Run-Query $SQL_DispoArtikel @{ "@art" = $art }
+            if ($info.Rows.Count -eq 0) { return "Artikel $art nicht gefunden. Tipp: artikel_suchen verwenden." }
+            $kopf = "Artikel $art - $($info.Rows[0]['Bezeichnung'])`nLink: /dispo?art=$art"
+            if ((ToNum $info.Rows[0]['Stuecklistentyp']) -eq 2) {
+                $null = Chat-Auftraege   # fuellt $script:Bestand
+                $k = Run-Query $SQL_DispoKomponenten @{ "@art" = $art }
+                $z = foreach ($r in $k.Rows) { "$($r['Element']) | $($r['Bezeichnung']) | $(FmtZahl $r['Menge']) je Set | $(FmtZahl $script:Bestand[[string]$r['Element']])" }
+                return "$kopf`nStueckliste (kein eigener Bestand). Bestandteil | Bezeichnung | Menge | Bestand`n" + ($z -join "`n")
+            }
+            if ((ToNum $info.Rows[0]['Lagerfuehrung']) -ne -1) { return "$kopf`nKein Lagerartikel (wird je Auftrag beschafft), daher kein Bestand." }
+            $t = Run-Query @"
+SELECT lpb.Lagerkennung, lp.Dimension1, lp.Dimension2, lp.Dimension3, SUM(lpb.Bestand) AS Bestand
+FROM KHKLagerplatzbestaende lpb
+LEFT JOIN KHKLagerplaetze lp ON lp.PlatzID = lpb.PlatzID AND lp.Mandant = lpb.Mandant
+WHERE lpb.Mandant = $Mandant AND lpb.Artikelnummer = @art AND lpb.Bestand <> 0
+GROUP BY lpb.Lagerkennung, lp.Dimension1, lp.Dimension2, lp.Dimension3
+ORDER BY SUM(lpb.Bestand) DESC
+"@ @{ "@art" = $art }
+            if ($t.Rows.Count -eq 0) { return "$kopf`nKein Bestand auf Lagerplaetzen." }
+            $summe = 0; $z = foreach ($r in $t.Rows) { $summe += [double]$r['Bestand']; "$(Fmt-Platz $r['Lagerkennung'] $r['Dimension1'] $r['Dimension2'] $r['Dimension3']) | $(FmtZahl $r['Bestand'])" }
+            return "$kopf`nGesamt: $(FmtZahl $summe). Wie viel davon schon fuer Auftraege verplant ist, zeigt artikel_dispo.`nLagerplatz | Bestand`n" + ($z -join "`n")
+        }
+        'offene_bestellungen' {
+            $p = @{}; $filter = ''
+            $art = ChatArg $inp 'artikelnummer'; if ($art) { $filter += ' AND p.Artikelnummer = @art'; $p['@art'] = $art }
+            $lief = ChatArg $inp 'lieferant'; if ($lief) { $filter += " AND b.A0Name1 LIKE '%' + @lief + '%'"; $p['@lief'] = $lief }
+            if ((ChatArg $inp 'nur_ueberfaellig') -eq 'True') { $filter += ' AND p.Liefertermin < CAST(GETDATE() AS date)' }
+            $t = Run-Query @"
+SELECT TOP 120 CAST(b.Belegjahr AS varchar) + '-' + CAST(b.Belegnummer AS varchar) AS Beleg, b.A0Name1 AS Lieferant, p.Artikelnummer, p.Bezeichnung1 AS Bezeichnung,
+       (vp.GGBestellt - vp.GGGeliefert) AS Offen, p.Liefertermin
+FROM KHKEKBelege b
+INNER JOIN KHKEKBelegePositionen p ON p.BelID = b.BelID AND p.Mandant = b.Mandant
+INNER JOIN KHKEKVorgaengePositionen vp ON vp.VorPosID = p.VorPosID AND vp.Mandant = p.Mandant
+INNER JOIN KHKEKVorgaenge v ON v.VorID = vp.VorID AND v.Mandant = vp.Mandant
+WHERE b.Mandant = $Mandant AND b.Belegart = 'Bestellung' AND v.GGErfuellt = 0 AND vp.GGErfuellt = 0 AND (vp.GGBestellt - vp.GGGeliefert) > 0 $filter
+ORDER BY p.Liefertermin, b.Belegnummer
+"@ $p
+            if ($t.Rows.Count -eq 0) { return 'Keine offenen Bestellungen fuer diese Auswahl.' }
+            $z = foreach ($r in $t.Rows) { "$(ChatDat $r['Liefertermin'])$(if ($r['Liefertermin'] -is [datetime] -and $r['Liefertermin'].Date -lt $heute) { ' (ueberfaellig)' }) | $($r['Beleg']) | $($r['Lieferant']) | $($r['Artikelnummer']) (/dispo?art=$($r['Artikelnummer'])) | $($r['Bezeichnung']) | $(FmtZahl $r['Offen'])" }
+            return "$($t.Rows.Count) offene Bestellpositionen$(if ($t.Rows.Count -ge 120) { ' (Limit 120 erreicht)' }).`nLiefertermin | Bestellung | Lieferant | Artikel (Link) | Bezeichnung | Offen`n" + ($z -join "`n")
+        }
+        'lagerbewegungen' {
+            $von = ChatDatum (ChatArg $inp 'von') $heute.AddDays(-6)
+            $bis = ChatDatum (ChatArg $inp 'bis') $heute
+            $p = @{ "@max" = 150; "@von" = $von; "@bis" = $bis.AddDays(1) }
+            $filter = @()
+            $typ = ChatArg $inp 'art'
+            if (@('um','zu','ab') -contains $typ) {
+                $codes = @($BewegungsArten.Keys | Where-Object { $BewegungsArten[$_][0] -eq $typ } | ForEach-Object { "'$_'" }) -join ','
+                $filter += "AND b.Bewegungsart IN ($codes)"
+            }
+            $art = ChatArg $inp 'artikelnummer'
+            if ($art) { $filter += "AND (b.Artikelnummer LIKE @art + '%' OR a.Bezeichnung1 LIKE '%' + @art + '%')"; $p['@art'] = $art }
+            $lager = ChatArg $inp 'lager'
+            if ($lager) { $filter += "AND " + (ChatPlatzBedingung $lager @(@('hp', 'hp'), @('zp', 'zp')) $p) }
+            $namen = Get-BenutzerNamen (Run-Query $SQL_BewegungenBenutzer $null) (Run-Query $SQL_MitarbeiterNamen $null)
+            $person = ChatArg $inp 'person'
+            if ($person) {
+                $codes = @($namen.Keys | Where-Object { $namen[$_].Name -like "*$person*" -or $_ -like "*$person*" })
+                if ($codes.Count -eq 0) { return "Keine Person mit Lagerbuchungen passt zu '$person'. Personen: " + ((@($namen.Values | ForEach-Object { $_.Name }) | Sort-Object -Unique) -join '; ') }
+                $ph = for ($i = 0; $i -lt $codes.Count; $i++) { $p["@w$i"] = $codes[$i]; "@w$i" }
+                $filter += "AND j.Benutzer IN ($($ph -join ','))"
+            }
+            $t = Run-Query ($SQL_Bewegungen -replace '\{FILTER\}', ($filter -join "`n  ")) $p
+            $link = "/bewegungen?von=$($von.ToString('yyyy-MM-dd'))&bis=$($bis.ToString('yyyy-MM-dd'))$(if ($typ) { "&typ=$typ" })$(if ($art) { "&art=$([uri]::EscapeDataString($art))" })$(if ($lager) { "&platz=$([uri]::EscapeDataString($(if ($p['@lk']) { $p['@lk'] } else { $lager })))" })"
+            if ($t.Rows.Count -eq 0) { return "Keine Lagerbuchungen $($von.ToString('dd.MM.yyyy')) bis $($bis.ToString('dd.MM.yyyy')) fuer diese Auswahl.`nLink: $link" }
+            $z = foreach ($r in $t.Rows) {
+                $b = [string]$r['Benutzer']; $n = if ($namen.ContainsKey($b)) { $namen[$b].Name } else { $b }
+                $ba = [string]$r['Bewegungsart']; $bez = if ($BewegungsArten.ContainsKey($ba)) { ChatText $BewegungsArten[$ba][1] } else { $ba }
+                $ref = ([string]$r['Referenz']).Trim(); if (-not $ref) { $ref = ([string]$r['Standardtext']).Trim() }
+                $wer = if ($r['Kunde'] -isnot [System.DBNull]) { " Kunde $($r['Kunde'])" } elseif ($r['Lieferant'] -isnot [System.DBNull]) { " Lieferant $($r['Lieferant'])" } else { '' }
+                "$(ChatDat $r['Bewegungsdatum']) | $n | $bez | $($r['Artikelnummer']) $($r['Bezeichnung']) | $(FmtZahl $r['Menge']) | $(Fmt-Platz $r['HKennung'] $r['HD1'] $r['HD2'] $r['HD3']) | $(Fmt-Platz $r['ZKennung'] $r['ZD1'] $r['ZD2'] $r['ZD3']) | $ref$wer"
+            }
+            return "$($t.Rows.Count) Buchungen$(if ($t.Rows.Count -ge 150) { ' (Limit 150 erreicht, es gibt mehr - Zeitraum eingrenzen)' }), $($von.ToString('dd.MM.yyyy')) bis $($bis.ToString('dd.MM.yyyy')), neueste zuerst.`nLink: $link`nDatum | Wer | Art | Artikel | Menge | Von | Nach | Bezug`n" + ($z -join "`n")
+        }
+        'lagerplatz_inhalt' {
+            $lager = ChatArg $inp 'lager'
+            if (-not $lager) { return 'Kein Lager angegeben.' }
+            $p = @{}; $bed = ChatPlatzBedingung $lager @(,@('lpb', 'lp')) $p
+            $t = Run-Query @"
+SELECT TOP 200 lpb.Lagerkennung, lp.Dimension1, lp.Dimension2, lp.Dimension3, lpb.Artikelnummer, a.Bezeichnung1, SUM(lpb.Bestand) AS Bestand
+FROM KHKLagerplatzbestaende lpb
+LEFT JOIN KHKLagerplaetze lp ON lp.PlatzID = lpb.PlatzID AND lp.Mandant = lpb.Mandant
+LEFT JOIN KHKArtikel a ON a.Artikelnummer = lpb.Artikelnummer AND a.Mandant = lpb.Mandant
+WHERE lpb.Mandant = $Mandant AND lpb.Bestand <> 0 AND $bed
+GROUP BY lpb.Lagerkennung, lp.Dimension1, lp.Dimension2, lp.Dimension3, lpb.Artikelnummer, a.Bezeichnung1
+ORDER BY lpb.Lagerkennung, lp.Dimension1, lp.Dimension2, lp.Dimension3, lpb.Artikelnummer
+"@ $p
+            if ($t.Rows.Count -eq 0) { return "Kein Bestand auf Lagerplaetzen, die mit '$lager' beginnen." }
+            $z = foreach ($r in $t.Rows) { "$(Fmt-Platz $r['Lagerkennung'] $r['Dimension1'] $r['Dimension2'] $r['Dimension3']) | $($r['Artikelnummer']) | $($r['Bezeichnung1']) | $(FmtZahl $r['Bestand'])" }
+            return "$($t.Rows.Count) Eintraege$(if ($t.Rows.Count -ge 200) { ' (Limit 200 erreicht)' }).`nLagerplatz | Artikel | Bezeichnung | Bestand`n" + ($z -join "`n")
+        }
+        default { return "Unbekanntes Werkzeug: $name" }
+    }
+}
+
+# Fortschrittstext fuer das Chatfenster (HTML, wird per innerHTML gesetzt)
+function ChatSchrittText($name, $inp) {
+    $a = [System.Net.WebUtility]::HtmlEncode((ChatArg $inp 'artikelnummer'))
+    switch ($name) {
+        'artikel_suchen'      { "Suche Artikel &bdquo;$([System.Net.WebUtility]::HtmlEncode((ChatArg $inp 'suchtext')))&ldquo; &hellip;" }
+        'offene_auftraege'    { "Lese offene Auftr&auml;ge &hellip;" }
+        'auftrag'             { "Lese Auftrag &hellip;" }
+        'materialbedarf'      { "Pr&uuml;fe Materialbedarf &hellip;" }
+        'montagetermine'      { "Schaue in den Montagekalender &hellip;" }
+        'artikel_dispo'       { "Schaue in die Dispo von $a &hellip;" }
+        'lagerbestand'        { "Pr&uuml;fe Lagerbestand von $a &hellip;" }
+        'offene_bestellungen' { "Lese offene Bestellungen &hellip;" }
+        'lagerbewegungen'     { "Lese Lagerbewegungen &hellip;" }
+        'lagerplatz_inhalt'   { "Lese Lagerplatz &hellip;" }
+        default               { "Frage Sage ab &hellip;" }
+    }
+}
+
+function Invoke-AnthropicApi($key, $body) {
+    for ($versuch = 1; $versuch -le 3; $versuch++) {
+        $wc = New-Object System.Net.WebClient
+        $wc.Encoding = [System.Text.Encoding]::UTF8
+        $wc.Headers.Add('x-api-key', $key)
+        $wc.Headers.Add('anthropic-version', '2023-06-01')
+        $wc.Headers.Add('content-type', 'application/json')
+        try {
+            $txt = $wc.UploadString('https://api.anthropic.com/v1/messages', 'POST', $body)
+            return ($txt | ConvertFrom-Json)
+        } catch {
+            $ex = $_.Exception
+            while ($ex -and $ex -isnot [System.Net.WebException]) { $ex = $ex.InnerException }
+            $code = 0; $detail = $_.Exception.Message
+            if ($ex -and $ex.Response) {
+                $code = [int]$ex.Response.StatusCode
+                $sr = New-Object System.IO.StreamReader($ex.Response.GetResponseStream(), [System.Text.Encoding]::UTF8)
+                $detail = $sr.ReadToEnd(); $sr.Close()
+            }
+            # Ueberlastung / Rate-Limit: kurz warten und erneut versuchen
+            if ($versuch -lt 3 -and @(429, 500, 502, 503, 529) -contains $code) { Start-Sleep -Seconds (3 * $versuch); continue }
+            throw "API-Fehler $code`: $detail"
+        } finally { $wc.Dispose() }
+    }
+}
+
+# Laeuft im Hintergrund-Runspace. $status ist eine synchronisierte Hashtable fuer den Fortschritt.
+function Invoke-ChatAnfrage($verlauf, $status) {
+    $erg = @{ Antwort = ''; Fehler = ''; TokensEin = 0; CacheLesen = 0; CacheSchreiben = 0; TokensAus = 0; Werkzeuge = (New-Object System.Collections.ArrayList) }
+    try {
+        $key = Get-ChatApiKey
+        if (-not $key) { $erg.Fehler = 'Kein API-Schl&uuml;ssel hinterlegt (ANTHROPIC_API_KEY).'; return $erg }
+        $script:ChatAuZeit = $null   # pro Frage frische Auftragsdaten
+        $msgs = New-Object System.Collections.ArrayList
+        foreach ($m in $verlauf) { [void]$msgs.Add([ordered]@{ role = $m.role; content = $m.content }) }
+        $de = [System.Globalization.CultureInfo]::GetCultureInfo('de-DE')
+        $system = $ChatSystemPrompt.Replace('{DATUM}', (Get-Date).ToString('dddd, dd.MM.yyyy', $de))
+        $kopfJson = '{"model":' + (ConvertTo-JsonText $ChatModell) + ',"max_tokens":2000,' +
+                    '"system":[{"type":"text","text":' + (ConvertTo-JsonText $system) + ',"cache_control":{"type":"ephemeral"}}],' +
+                    '"tools":' + $ChatToolsJson + ',"messages":'
+        for ($runde = 1; $runde -le $ChatMaxRunden; $runde++) {
+            $status.Schritt = if ($runde -eq 1) { 'Denke nach &hellip;' } else { 'Werte die Daten aus &hellip;' }
+            $resp = Invoke-AnthropicApi $key ($kopfJson + (ConvertTo-JsonText $msgs) + '}')
+            $u = $resp.usage
+            if ($u) {
+                $erg.TokensEin += [int]$u.input_tokens
+                $erg.CacheLesen += [int]$u.cache_read_input_tokens
+                $erg.CacheSchreiben += [int]$u.cache_creation_input_tokens
+                $erg.TokensAus += [int]$u.output_tokens
+            }
+            [void]$msgs.Add([ordered]@{ role = 'assistant'; content = @($resp.content) })
+            if ($resp.stop_reason -eq 'tool_use') {
+                $ergebnisse = New-Object System.Collections.ArrayList
+                foreach ($blk in @($resp.content)) {
+                    if ($blk.type -ne 'tool_use') { continue }
+                    [void]$erg.Werkzeuge.Add($blk.name)
+                    $status.Schritt = ChatSchrittText $blk.name $blk.input
+                    $istFehler = $false
+                    try { $txt = ChatKuerzen ([string](Invoke-ChatTool $blk.name $blk.input)) 20000 }
+                    catch { $txt = "Fehler beim Abfragen: $($_.Exception.Message)"; $istFehler = $true }
+                    [void]$ergebnisse.Add([ordered]@{ type = 'tool_result'; tool_use_id = $blk.id; content = $txt; is_error = $istFehler })
+                }
+                [void]$msgs.Add([ordered]@{ role = 'user'; content = $ergebnisse })
+                continue
+            }
+            $texte = @($resp.content | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text })
+            $erg.Antwort = ($texte -join "`n").Trim()
+            if ($resp.stop_reason -eq 'max_tokens') { $erg.Antwort += "`n`n_(Antwort wurde abgeschnitten.)_" }
+            return $erg
+        }
+        $erg.Fehler = 'Die Frage braucht zu viele Abfragen auf einmal &ndash; bitte konkreter oder in Teilfragen stellen.'
+    } catch {
+        $erg.Fehler = [System.Net.WebUtility]::HtmlEncode($_.Exception.Message)
+    }
+    return $erg
+}
+
+# Chatfenster (unten rechts). Einfaches HTML/ES5, Verlauf je Browser-Tab in sessionStorage.
+# Antworten werden als kleines Markdown-Subset gerendert (Fett, Listen, Tabellen, interne Links).
+$ChatWidgetHtml = @'
+<style>
+#chatknopf { position:fixed; right:20px; bottom:20px; z-index:1000; background:#343A40; color:#fff; border:2px solid #FFBC00; border-radius:24px; font-family:inherit;
+  padding:11px 18px; font-size:14px; font-weight:600; cursor:pointer; box-shadow:0 3px 10px rgba(0,0,0,.25); display:flex; align-items:center; gap:8px; }
+#chatknopf:hover { background:#23272b; }
+#chatpanel { position:fixed; right:20px; bottom:20px; z-index:1001; width:440px; max-width:calc(100vw - 32px); height:640px; max-height:calc(100vh - 40px);
+  background:#fff; border-radius:12px; box-shadow:0 8px 30px rgba(0,0,0,.3); display:none; flex-direction:column; overflow:hidden; font-size:14px; }
+#chatpanel.offen { display:flex; }
+.chatkopf { background:#343A40; color:#fff; padding:10px 14px; display:flex; align-items:center; gap:8px; }
+.chatkopf b { flex:1; font-size:15px; }
+.chatkopf .beta { font-size:10px; background:#FFBC00; color:#343A40; border-radius:8px; padding:1px 6px; font-weight:700; }
+.chatkopf button { background:none; border:1px solid #5d7286; color:#dfe6ed; border-radius:5px; padding:3px 8px; cursor:pointer; font-size:12px; }
+.chatkopf button:hover { background:#23272b; color:#fff; }
+#chatverlauf { flex:1; overflow-y:auto; padding:12px; background:#F8F9FA; display:flex; flex-direction:column; gap:10px; }
+.cm { max-width:92%; padding:8px 12px; border-radius:10px; line-height:1.45; overflow-wrap:anywhere; }
+.cm-user { align-self:flex-end; background:#343A40; color:#fff; white-space:pre-wrap; }
+.cm-bot { align-self:flex-start; background:#fff; border:1px solid #e1e4e8; }
+.cm-bot p { margin:0 0 6px; } .cm-bot p:last-child { margin-bottom:0; }
+.cm-bot ul, .cm-bot ol { margin:4px 0 6px; padding-left:20px; }
+.cm-bot a { color:#086ED5; font-weight:600; text-decoration:none; } .cm-bot a:hover { text-decoration:underline; }
+.cm-bot table { font-size:12px; box-shadow:none; margin:4px 0; border:1px solid #e1e4e8; }
+.cm-bot th { position:static; background:#fff8e0; color:#1a1a1a; cursor:default; padding:4px 6px; }
+.cm-bot td { padding:4px 6px; }
+.cm-bot h4 { margin:6px 0 4px; font-size:14px; }
+.cm-warte { align-self:flex-start; color:#666; font-style:italic; background:none; padding:4px 2px; }
+.cm-fehler { align-self:flex-start; background:#fdecea; color:#b71c1c; }
+.chatfuss { border-top:1px solid #e1e4e8; padding:8px; display:flex; gap:8px; align-items:flex-end; }
+#chateingabe { flex:1; resize:none; border:1px solid #ccc; border-radius:6px; padding:8px; font:inherit; font-size:14px; max-height:120px; }
+#chatsenden { background:#343A40; color:#fff; border:none; border-radius:999px; font-family:inherit; padding:9px 14px; cursor:pointer; font-weight:600; }
+#chatsenden:disabled { opacity:.5; cursor:default; }
+.chathinweis { font-size:11px; color:#888; padding:0 10px 8px; }
+.chatleer { color:#666; font-size:13px; }
+.chatleer a { display:block; margin:6px 0; color:#086ED5; cursor:pointer; }
+.bewertung { margin-top:6px; padding-top:6px; border-top:1px solid #eef0f2; display:flex; flex-wrap:wrap; gap:6px; align-items:center; font-size:12px; color:#888; }
+.bewertung button { background:#fff; border:1px solid #d0d5db; border-radius:12px; padding:1px 9px; cursor:pointer; font-size:13px; line-height:1.6; }
+.bewertung button:hover { background:#fff8e0; }
+.bewertung textarea { width:100%; border:1px solid #ccc; border-radius:6px; padding:6px; font:inherit; font-size:13px; resize:vertical; }
+.bewertung .senden { background:#343A40; color:#fff; border-color:#343A40; border-radius:6px; font-size:12px; padding:3px 10px; }
+</style>
+<button id='chatknopf' type='button' onclick='chatAuf(true)'>
+  <svg width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z'/></svg>
+  Frage stellen
+</button>
+<div id='chatpanel' role='dialog' aria-label='Assistent'>
+  <div class='chatkopf'><b>Assistent</b><span class='beta'>TEST</span>
+    <button type='button' onclick='chatNeu()' title='Gespr&auml;ch leeren'>Neu</button>
+    <button type='button' onclick='chatAuf(false)' title='Schlie&szlig;en'>&times;</button></div>
+  <div id='chatverlauf'></div>
+  <div class='chatfuss'>
+    <textarea id='chateingabe' rows='2' placeholder='Frage zu Auftr&auml;gen, Montage, Material, Lager ...'></textarea>
+    <button id='chatsenden' type='button' onclick='chatSenden()'>Senden</button>
+  </div>
+  <div class='chathinweis'>Antworten basieren auf Sage-Daten, k&ouml;nnen aber Fehler enthalten &ndash; wichtige Zahlen &uuml;ber die Links pr&uuml;fen.</div>
+</div>
+<script>
+(function(){
+  var verlauf = [], laeuft = false;
+  function lies(k){ try { return sessionStorage.getItem(k); } catch(e) { return null; } }
+  function schreib(k, v){ try { sessionStorage.setItem(k, v); } catch(e) {} }
+  try { verlauf = JSON.parse(lies('solarChat') || '[]') || []; } catch(e) { verlauf = []; }
+  var panel = document.getElementById('chatpanel'), box = document.getElementById('chatverlauf'),
+      ein = document.getElementById('chateingabe'), btn = document.getElementById('chatsenden'), knopf = document.getElementById('chatknopf');
+
+  function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+  function inline(s){
+    s = esc(s);
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+    s = s.replace(/(^|[^*])\*([^*\s][^*]*)\*/g, '$1<i>$2</i>');
+    s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+    s = s.replace(/\[([^\]]+)\]\((\/[^)\s]*)\)/g, function(m, t, h){ return "<a href='" + h.replace(/'/g,'%27') + "'>" + t + '</a>'; });
+    return s;
+  }
+  function md(text){
+    var zeilen = String(text).split('\n'), html = '', i = 0, liste = null;
+    function listeZu(){ if (liste) { html += '</' + liste + '>'; liste = null; } }
+    while (i < zeilen.length) {
+      var z = zeilen[i], m;
+      if (/^\s*\|.*\|\s*$/.test(z)) {
+        listeZu();
+        var t = '<table>', kopf = true;
+        while (i < zeilen.length && /^\s*\|.*\|\s*$/.test(zeilen[i])) {
+          var zz = zeilen[i].trim();
+          if (/^\|[\s:|-]+\|$/.test(zz)) { i++; continue; }
+          var zellen = zz.replace(/^\||\|$/g, '').split('|'), tag = kopf ? 'th' : 'td';
+          t += '<tr>';
+          for (var c = 0; c < zellen.length; c++) t += '<' + tag + '>' + inline(zellen[c].trim()) + '</' + tag + '>';
+          t += '</tr>'; kopf = false; i++;
+        }
+        html += t + '</table>'; continue;
+      }
+      if ((m = /^\s*[-*]\s+(.*)$/.exec(z))) { if (liste !== 'ul') { listeZu(); html += '<ul>'; liste = 'ul'; } html += '<li>' + inline(m[1]) + '</li>'; i++; continue; }
+      if ((m = /^\s*\d+[.)]\s+(.*)$/.exec(z))) { if (liste !== 'ol') { listeZu(); html += '<ol>'; liste = 'ol'; } html += '<li>' + inline(m[1]) + '</li>'; i++; continue; }
+      listeZu();
+      if ((m = /^#{1,6}\s+(.*)$/.exec(z))) { html += '<h4>' + inline(m[1]) + '</h4>'; i++; continue; }
+      if (z.trim() === '') { i++; continue; }
+      var absatz = [z]; i++;
+      while (i < zeilen.length && zeilen[i].trim() !== '' && !/^\s*([-*]|\d+[.)]|\||#)/.test(zeilen[i])) { absatz.push(zeilen[i]); i++; }
+      html += '<p>' + absatz.map(inline).join('<br>') + '</p>';
+    }
+    listeZu();
+    return html;
+  }
+  function blase(cls, inhaltHtml){ var d = document.createElement('div'); d.className = 'cm ' + cls; d.innerHTML = inhaltHtml; box.appendChild(d); box.scrollTop = box.scrollHeight; return d; }
+  function bewerten(idx, wert, kommentar){
+    var e = verlauf[idx]; if (!e) return;
+    e.bewertet = wert; schreib('solarChat', JSON.stringify(verlauf));
+    var frage = (idx > 0 && verlauf[idx - 1].role === 'user') ? verlauf[idx - 1].content : '';
+    var x = new XMLHttpRequest();
+    x.open('POST', '/api/chat-bewertung'); x.setRequestHeader('Content-Type', 'application/json; charset=utf-8');
+    x.send(JSON.stringify({ id: e.id || '', bewertung: wert, frage: frage, antwort: e.content, kommentar: kommentar || '' }));
+  }
+  function leiste(d, idx){
+    var e = verlauf[idx]; if (!e.id) return;
+    var l = document.createElement('div'); l.className = 'bewertung'; d.appendChild(l);
+    if (e.bewertet) { l.innerHTML = (e.bewertet === 'gut' ? '&#128077;' : '&#128078;') + ' Danke f&uuml;r die R&uuml;ckmeldung'; return; }
+    l.innerHTML = 'Hilfreich? <button type="button" title="Antwort war richtig und hilfreich">&#128077;</button><button type="button" title="Antwort war falsch oder nicht hilfreich">&#128078;</button>';
+    var b = l.getElementsByTagName('button');
+    b[0].onclick = function(){ bewerten(idx, 'gut', ''); l.innerHTML = '&#128077; Danke f&uuml;r die R&uuml;ckmeldung'; };
+    b[1].onclick = function(){
+      l.innerHTML = '<textarea rows="2" placeholder="Was war falsch oder hat gefehlt? (optional)"></textarea><button type="button" class="senden">Absenden</button>';
+      var ta = l.getElementsByTagName('textarea')[0]; ta.focus();
+      l.getElementsByTagName('button')[0].onclick = function(){ bewerten(idx, 'schlecht', ta.value.trim()); l.innerHTML = '&#128078; Danke &ndash; wir schauen uns das an.'; };
+      box.scrollTop = box.scrollHeight;
+    };
+  }
+  function botBlase(idx){ var d = blase('cm-bot', md(verlauf[idx].content)); leiste(d, idx); box.scrollTop = box.scrollHeight; }
+  function zeichne(){
+    box.innerHTML = '';
+    if (verlauf.length === 0) {
+      var d = blase('chatleer', 'Ich beantworte Fragen zu Auftr&auml;gen, Montageterminen, Material und Lager mit den aktuellen Daten aus Sage und dem Montagekalender. Zum Beispiel:');
+      ['Was fehlt f\u00fcr die Montagen der n\u00e4chsten zwei Wochen?', 'Welche Montagen stehen n\u00e4chste Woche an und mit welchem Team?', 'Wie ist der Stand beim Auftrag Kafitz?', 'Wann ist der Speicher BYD HVS 5.1 wieder vollst\u00e4ndig da?'].forEach(function(q){
+        var a = document.createElement('a'); a.textContent = q; a.onclick = function(){ ein.value = q; chatSenden(); }; d.appendChild(a);
+      });
+      return;
+    }
+    for (var i = 0; i < verlauf.length; i++) {
+      if (verlauf[i].role === 'user') blase('cm-user', esc(verlauf[i].content));
+      else botBlase(i);
+    }
+  }
+  window.chatAuf = function(auf){
+    panel.className = auf ? 'offen' : ''; knopf.style.display = auf ? 'none' : 'flex';
+    schreib('solarChatOffen', auf ? '1' : '0');
+    if (auf) { zeichne(); setTimeout(function(){ ein.focus(); }, 50); }
+  };
+  window.chatNeu = function(){ if (laeuft) return; verlauf = []; schreib('solarChat', '[]'); zeichne(); };
+  window.chatSenden = function(){
+    var q = ein.value.trim(); if (!q || laeuft) return;
+    if (verlauf.length === 0) box.innerHTML = '';
+    verlauf.push({ role: 'user', content: q }); schreib('solarChat', JSON.stringify(verlauf));
+    blase('cm-user', esc(q)); ein.value = '';
+    laeuft = true; btn.disabled = true;
+    var warte = blase('cm-warte', 'Denke nach &hellip;');
+    function ende(){ laeuft = false; btn.disabled = false; if (warte.parentNode) warte.parentNode.removeChild(warte); }
+    function fehler(t){ ende(); verlauf.pop(); schreib('solarChat', JSON.stringify(verlauf)); blase('cm-fehler', t); }
+    var x = new XMLHttpRequest();
+    x.open('POST', '/api/chat'); x.setRequestHeader('Content-Type', 'application/json; charset=utf-8');
+    x.onload = function(){
+      var r; try { r = JSON.parse(x.responseText); } catch(e) { return fehler('Unerwartete Antwort vom Server.'); }
+      if (!r.id) return fehler(r.fehler || 'Chat ist nicht verf&uuml;gbar.');
+      var start = new Date().getTime();
+      (function frage(){
+        var y = new XMLHttpRequest();
+        y.open('GET', '/api/chat?id=' + encodeURIComponent(r.id));
+        y.onload = function(){
+          var s; try { s = JSON.parse(y.responseText); } catch(e) { return fehler('Unerwartete Antwort vom Server.'); }
+          if (s.status === 'fertig') {
+            ende(); verlauf.push({ role: 'assistant', content: s.antwort, id: r.id }); schreib('solarChat', JSON.stringify(verlauf));
+            botBlase(verlauf.length - 1); return;
+          }
+          if (s.status === 'fehler') return fehler(s.fehler || 'Fehler.');
+          if (new Date().getTime() - start > 180000) return fehler('Keine Antwort nach 3 Minuten &ndash; bitte erneut versuchen.');
+          if (s.schritt) warte.innerHTML = s.schritt;
+          setTimeout(frage, 1000);
+        };
+        y.onerror = function(){ fehler('Verbindung zum Server unterbrochen.'); };
+        y.send();
+      })();
+    };
+    x.onerror = function(){ fehler('Server nicht erreichbar.'); };
+    x.send(JSON.stringify({ messages: verlauf.slice(-12).map(function(m){ return { role: m.role, content: m.content }; }) }));
+  };
+  ein.addEventListener('keydown', function(e){ if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); chatSenden(); } });
+  if (lies('solarChatOffen') === '1') chatAuf(true);
+})();
+</script>
+'@
+
 # ---------- Dienst ----------
 if ($MyInvocation.InvocationName -eq '.') { return }   # dot-gesourct (Test): nur Funktionen laden
+
+# Hintergrund-Runspaces fuer den Chat: bekommen alle Funktionen und alle Einstellungen/SQL-Texte dieses Skripts
+$ChatPool = $null
+$ChatJobs = @{}
+try {
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+    $chatVarNamen = @(Get-Variable -Scope Script | Where-Object { $StartVariablen -notcontains $_.Name -and @('StartVariablen', 'ChatPool', 'ChatJobs') -notcontains $_.Name } | ForEach-Object { $_.Name })
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $skriptAst = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$null, [ref]$null)
+    foreach ($st in $skriptAst.EndBlock.Statements) {
+        if ($st -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { continue }
+        $rumpf = $st.Body.Extent.Text; $rumpf = $rumpf.Substring(1, $rumpf.Length - 2)
+        if ($st.Parameters) { $rumpf = "param(" + (($st.Parameters | ForEach-Object { $_.Extent.Text }) -join ', ') + ")`n" + $rumpf }
+        $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($st.Name, $rumpf)))
+    }
+    foreach ($n in $chatVarNamen) {
+        $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($n, (Get-Variable -Scope Script -Name $n).Value, '')))
+    }
+    $ChatPool = [runspacefactory]::CreateRunspacePool(1, 3, $iss, $Host)
+    $ChatPool.Open()
+} catch {
+    Write-Host "Assistent nicht verfuegbar: $($_.Exception.Message)" -ForegroundColor Yellow
+    $ChatPool = $null
+}
 
 $listener = New-Object System.Net.HttpListener
 $listener.Prefixes.Add("http://+:$Port/")
@@ -2343,6 +3113,102 @@ ORDER BY Lagerkennung, ISNULL(Dimension1, 0), ISNULL(Dimension2, 0), ISNULL(Dime
             } catch {
                 $ausgabe = Build-Bewegungen $null $f $namen $max ($_.Exception.ToString())
             }
+        } elseif ($pfad -eq "/chat-an" -or $pfad -eq "/chat-aus") {
+            # --- Testfreigabe des Assistenten fuer diesen Browser (Cookie, 1 Jahr) ---
+            $an = ($pfad -eq "/chat-an")
+            $ck = New-Object System.Net.Cookie('solarchat', $(if ($an) { '1' } else { '0' }), '/')
+            $ck.Expires = (Get-Date).AddDays($(if ($an) { 365 } else { -1 }))
+            $response.Cookies.Add($ck)
+            $hinweis = if ($null -eq $ChatPool) { "Der Assistent konnte beim Start nicht geladen werden (siehe Dienst-Log)." }
+                       elseif (-not (Get-ChatApiKey)) { "Achtung: Auf dem Server ist noch kein API-Schl&uuml;ssel (ANTHROPIC_API_KEY) hinterlegt &ndash; das Chatfenster erscheint erst danach." }
+                       else { "" }
+            $ausgabe = "$(Page-Head 'Assistent')<div class='kopf'><h1>Assistent $(if ($an) { 'freigeschaltet' } else { 'ausgeschaltet' })</h1></div>" +
+                       "<p>$(if ($an) { 'In diesem Browser erscheint jetzt unten rechts der Knopf &bdquo;Frage stellen&ldquo;. Ausschalten mit <a href=''/chat-aus''>/chat-aus</a>.' } else { 'Das Chatfenster wird in diesem Browser nicht mehr angezeigt.' })</p>" +
+                       "$(if ($hinweis) { "<p class='warn'>$hinweis</p>" })<p><a class='btn' href='/'>Zur Solar Dispo</a></p></body></html>"
+
+        } elseif ($pfad -eq "/api/chat") {
+            # --- Assistent: POST startet eine Anfrage im Hintergrund, GET ?id= liefert den Stand ---
+            $contentType = "application/json; charset=utf-8"
+            # alte, nicht abgeholte Anfragen aufraeumen
+            foreach ($altId in @($ChatJobs.Keys)) {
+                if (((Get-Date) - $ChatJobs[$altId].Start).TotalMinutes -gt 10) { try { $ChatJobs[$altId].PS.Dispose() } catch {}; $ChatJobs.Remove($altId) }
+            }
+            if (-not (Test-ChatErlaubt)) {
+                $ausgabe = '{"fehler":"Der Assistent ist f\u00fcr diesen Browser nicht freigeschaltet."}'
+            } elseif ($request.HttpMethod -eq 'POST') {
+                try {
+                    $sr = New-Object System.IO.StreamReader($request.InputStream, [System.Text.Encoding]::UTF8)
+                    $daten = $sr.ReadToEnd() | ConvertFrom-Json; $sr.Close()
+                    # nur Text-Nachrichten user/assistant, beginnend mit user, abwechselnd
+                    $verlauf = New-Object System.Collections.ArrayList
+                    foreach ($m in @($daten.messages)) {
+                        $rolle = [string]$m.role; $inhalt = [string]$m.content
+                        if (@('user', 'assistant') -notcontains $rolle -or [string]::IsNullOrWhiteSpace($inhalt)) { continue }
+                        if ($verlauf.Count -eq 0 -and $rolle -ne 'user') { continue }
+                        if ($verlauf.Count -gt 0 -and $verlauf[$verlauf.Count - 1].role -eq $rolle) { $verlauf.RemoveAt($verlauf.Count - 1) }
+                        if ($inhalt.Length -gt 6000) { $inhalt = $inhalt.Substring(0, 6000) }
+                        [void]$verlauf.Add(@{ role = $rolle; content = $inhalt })
+                    }
+                    if ($verlauf.Count -eq 0 -or $verlauf[$verlauf.Count - 1].role -ne 'user') { throw "keine Frage" }
+                    $id = [guid]::NewGuid().ToString('N')
+                    $status = [hashtable]::Synchronized(@{ Schritt = 'Denke nach &hellip;' })
+                    $ps = [powershell]::Create()
+                    $ps.RunspacePool = $ChatPool
+                    [void]$ps.AddScript('param($v, $s) Invoke-ChatAnfrage $v $s').AddArgument($verlauf).AddArgument($status)
+                    $ChatJobs[$id] = @{ PS = $ps; Handle = $ps.BeginInvoke(); Status = $status; Start = Get-Date; Frage = $verlauf[$verlauf.Count - 1].content }
+                    $ausgabe = '{"id":"' + $id + '"}'
+                } catch {
+                    $ausgabe = '{"fehler":' + (ConvertTo-JsonText ([System.Net.WebUtility]::HtmlEncode("Anfrage konnte nicht gestartet werden: $($_.Exception.Message)"))) + '}'
+                }
+            } else {
+                $id = Parse-Query $query "id"
+                if (-not $id -or -not $ChatJobs.ContainsKey($id)) {
+                    $ausgabe = '{"status":"fehler","fehler":"Anfrage nicht gefunden (Server neu gestartet?) \u2013 bitte erneut senden."}'
+                } else {
+                    $job = $ChatJobs[$id]
+                    if (-not $job.Handle.IsCompleted) {
+                        $ausgabe = '{"status":"laeuft","schritt":' + (ConvertTo-JsonText $job.Status.Schritt) + '}'
+                    } else {
+                        $erg = $null
+                        try { $erg = @($job.PS.EndInvoke($job.Handle))[0] } catch { $erg = @{ Fehler = [System.Net.WebUtility]::HtmlEncode($_.Exception.Message); Werkzeuge = @() } }
+                        if ($null -eq $erg) { $erg = @{ Fehler = 'Keine Antwort erhalten.'; Werkzeuge = @() } }
+                        $dauer = [int]((Get-Date) - $job.Start).TotalSeconds
+                        try { $job.PS.Dispose() } catch {}
+                        $ChatJobs.Remove($id)
+                        # Protokoll (Frage, Werkzeuge, Tokens - keine Antworten)
+                        try {
+                            $frageLog = [string]$job.Frage; if ($frageLog.Length -gt 1000) { $frageLog = $frageLog.Substring(0, 1000) }
+                            $eintrag = [ordered]@{ zeit = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); id = $id; ip = [string]$request.RemoteEndPoint.Address; dauer = $dauer
+                                                   ein = [int]$erg.TokensEin; cacheLesen = [int]$erg.CacheLesen; cacheSchreiben = [int]$erg.CacheSchreiben; aus = [int]$erg.TokensAus
+                                                   werkzeuge = @($erg.Werkzeuge); frage = $frageLog; fehler = [string]$erg.Fehler }
+                            [System.IO.File]::AppendAllText($ChatProtokollPfad, (ConvertTo-JsonText $eintrag) + "`r`n", [System.Text.Encoding]::UTF8)
+                        } catch {}
+                        if ($erg.Fehler) { $ausgabe = '{"status":"fehler","fehler":' + (ConvertTo-JsonText $erg.Fehler) + '}' }
+                        else { $ausgabe = '{"status":"fertig","antwort":' + (ConvertTo-JsonText $erg.Antwort) + '}' }
+                    }
+                }
+            }
+
+        } elseif ($pfad -eq "/api/chat-bewertung") {
+            # --- Daumen hoch/runter zu einer Antwort ---
+            $contentType = "application/json; charset=utf-8"
+            $ausgabe = '{"ok":false}'
+            if ($request.HttpMethod -eq 'POST') {
+                try {
+                    $sr = New-Object System.IO.StreamReader($request.InputStream, [System.Text.Encoding]::UTF8)
+                    $b = $sr.ReadToEnd() | ConvertFrom-Json; $sr.Close()
+                    $kurz = { param($s, $n) $s = [string]$s; if ($s.Length -gt $n) { $s.Substring(0, $n) } else { $s } }
+                    if (@('gut', 'schlecht') -contains [string]$b.bewertung) {
+                        $eintrag = [ordered]@{ zeit = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+                                               id = $(if ([string]$b.id -match '^[0-9a-f]{32}$') { [string]$b.id } else { '' })
+                                               ip = [string]$request.RemoteEndPoint.Address; bewertung = [string]$b.bewertung
+                                               frage = (& $kurz $b.frage 2000); antwort = (& $kurz $b.antwort 8000); kommentar = (& $kurz $b.kommentar 2000) }
+                        [System.IO.File]::AppendAllText($ChatBewertungPfad, (ConvertTo-JsonText $eintrag) + "`r`n", [System.Text.Encoding]::UTF8)
+                        $ausgabe = '{"ok":true}'
+                    }
+                } catch {}
+            }
+
         } elseif ($pfad -eq "/datei") {
             # Datei aus der Sage-Sammelmappe ausliefern - nur Pfade, die in KHKSammelmappen stehen
             $dId = 0; [void][int]::TryParse(((Parse-Query $query "id") -replace '[^0-9]', ''), [ref]$dId)
