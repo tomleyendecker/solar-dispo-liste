@@ -383,6 +383,7 @@ tr.erledigt td, tr.erledigt td a.artlink { color:#9aa0a6; }
   <a class='nav$(if ($pfad -eq '/material') { ' aktiv' })' href='/material'>Materialbedarf</a>
   <a class='nav$(if ($pfad -eq '/angebote') { ' aktiv' })' href='/angebote'>Angebote</a>
   <a class='nav$(if ($pfad -eq '/dispo') { ' aktiv' })' href='/dispo'>Dispo</a>
+  <a class='nav$(if ($pfad -eq '/bewegungen') { ' aktiv' })' href='/bewegungen'>Bewegungen</a>
 </nav>
 "@
 }
@@ -1275,11 +1276,12 @@ $VerbrauchChartJs
 "@
 }
 
+# Bewegungsart -> Gruppe (Filter), Klartext, Farbe
 $BewegungsArten = @{
-    'ZB' = @('zu', 'Wareneingang Bestellung'); 'ZM' = @('zu', 'Zugang manuell'); 'SZ' = @('zu', 'Zugang manuell (schwebend)')
-    'ZR' = @('zu', 'R&uuml;cklieferung Kunde'); 'ZS' = @('zu', 'Storno Lieferung'); 'ZV' = @('zu', 'Inventur Zugang')
-    'EA' = @('ab', 'Lieferung an Kunde'); 'EM' = @('ab', 'Entnahme manuell'); 'ES' = @('ab', 'Storno Zugang'); 'EV' = @('ab', 'Inventur Abgang')
-    'ER' = @('ab', 'R&uuml;cksendung an Lieferant'); 'IU' = @('um', 'Umbuchung')
+    'ZB' = @('zu', 'Wareneingang Bestellung', 'zu'); 'ZM' = @('zu', 'Zugang manuell', 'zu'); 'SZ' = @('zu', 'Zugang manuell (schwebend)', 'zu')
+    'ZR' = @('zu', 'R&uuml;cklieferung Kunde', 'zu'); 'ZS' = @('zu', 'Storno Lieferung', 'zu'); 'ZV' = @('zu', 'Inventur Zugang', 'inv')
+    'EA' = @('ab', 'Lieferung an Kunde', 'ab'); 'EM' = @('ab', 'Entnahme manuell', 'ab'); 'ES' = @('ab', 'Storno Zugang', 'ab'); 'EV' = @('ab', 'Inventur Abgang', 'inv')
+    'ER' = @('ab', 'R&uuml;cksendung an Lieferant', 'ab'); 'IU' = @('um', 'Umbuchung', 'um')
 }
 $DispoCss = @"
 <style>
@@ -1864,6 +1866,348 @@ function Dispo-Seite($art) {
 }
 
 
+# ---------- Lagerbewegungsprotokoll (aus der Oezer-Liste) ----------
+# ---- SQL: Lagerbewegungsprotokoll ----
+# Jede Lagerplatzbuchung gehoert zu einem Job; dort steht der Sage-Benutzer (Kuerzel wie "AKr"
+# oder bei Scannerbuchungen "MDE <Nachname>"). Sage speichert nur das Datum - eine Uhrzeit gibt
+# es lediglich fuer MDE-Kommissionierbuchungen (IaswebdeMdeKommissionierbuchungen).
+# Buchungen mit Menge 0 sind interne Gegenbuchungen ohne Bestandswirkung.
+$SQL_Bewegungen = @"
+SELECT TOP (@max)
+    b.BuchungsID, b.Bewegungsdatum, b.Bewegungsart, b.Artikelnummer, a.Bezeichnung1 AS Bezeichnung,
+    b.MengeBasis AS Menge, b.Referenz, j.Standardtext, j.Memo, j.Benutzer,
+    hp.Lagerkennung AS HKennung, hp.Dimension1 AS HD1, hp.Dimension2 AS HD2, hp.Dimension3 AS HD3,
+    zp.Lagerkennung AS ZKennung, zp.Dimension1 AS ZD1, zp.Dimension2 AS ZD2, zp.Dimension3 AS ZD3,
+    mde.Zeit, kd.Name AS Kunde, lf.Name AS Lieferant
+FROM KHKLagerplatzbuchungen b
+INNER JOIN KHKLagerplatzbuchungenJobs j ON j.Job = b.Job AND j.Mandant = b.Mandant
+LEFT JOIN KHKArtikel a       ON a.Artikelnummer = b.Artikelnummer AND a.Mandant = b.Mandant
+LEFT JOIN KHKLagerplaetze hp ON hp.PlatzID = b.HerkunftsLPKennung AND hp.Mandant = b.Mandant
+LEFT JOIN KHKLagerplaetze zp ON zp.PlatzID = b.ZielLPKennung AND zp.Mandant = b.Mandant
+LEFT JOIN (SELECT BuchungsId, MIN([Timestamp]) AS Zeit FROM IaswebdeMdeKommissionierbuchungen
+           WHERE Mandant = $Mandant GROUP BY BuchungsId) mde ON mde.BuchungsId = b.BuchungsID
+OUTER APPLY (SELECT TOP 1 v.A0Name1 AS Name FROM KHKVKBelege v
+             WHERE b.Bewegungsart IN ('EA', 'ZS', 'ZR', 'SR') AND b.Referenz LIKE '[0-9][0-9][0-9][0-9]-%' AND v.Mandant = b.Mandant
+               AND v.Belegjahr = TRY_CAST(LEFT(b.Referenz, 4) AS int) AND v.Belegnummer = TRY_CAST(SUBSTRING(b.Referenz, 6, 20) AS int)
+             ORDER BY CASE v.Belegkennzeichen WHEN 'VLL' THEN 0 WHEN 'VFR' THEN 1 ELSE 2 END) kd
+OUTER APPLY (SELECT TOP 1 e.A0Name1 AS Name FROM KHKEKBelege e
+             WHERE b.Bewegungsart IN ('ZB', 'SB', 'ES', 'ER') AND b.Referenz LIKE '[0-9][0-9][0-9][0-9]-%' AND e.Mandant = b.Mandant
+               AND e.Belegjahr = TRY_CAST(LEFT(b.Referenz, 4) AS int) AND e.Belegnummer = TRY_CAST(SUBSTRING(b.Referenz, 6, 20) AS int)) lf
+WHERE b.Mandant = $Mandant AND b.MengeBasis <> 0
+  AND b.Bewegungsdatum >= @von AND b.Bewegungsdatum < @bis
+  {FILTER}
+ORDER BY b.Bewegungsdatum DESC, b.BuchungsID DESC
+"@
+
+# ---- SQL: Benutzer mit Lagerbuchungen (fuer die Personenauswahl) und Klarnamen ----
+$SQL_BewegungenBenutzer = @"
+SELECT DISTINCT j.Benutzer FROM KHKLagerplatzbuchungenJobs j
+WHERE j.Mandant = $Mandant AND j.Erfassungsdatum > DATEADD(day, -365, GETDATE()) AND ISNULL(j.Benutzer, '') <> ''
+"@
+$SQL_MitarbeiterNamen = @"
+SELECT UserName, Vorname, Nachname FROM KHKMitarbeiter WHERE Mandant = $Mandant
+"@
+
+# Sage-Benutzer -> lesbarer Name. Kuerzel ueber KHKMitarbeiter.UserName, Scannerbenutzer
+# "MDE <Nachname>" ueber einen eindeutigen Nachnamen.
+function Get-BenutzerNamen($benutzerTab, $maTab) {
+    $perUser = @{}; $perNachname = @{}
+    if ($maTab) {
+        foreach ($m in $maTab.Rows) {
+            $voll = ("$($m['Vorname']) $($m['Nachname'])").Trim()
+            if ($voll -eq '') { continue }
+            $u = [string]$m["UserName"]; if ($u -ne '') { $perUser[$u] = $voll }
+            $n = ([string]$m["Nachname"]).Trim()
+            if ($n -ne '') { if ($perNachname.ContainsKey($n)) { $perNachname[$n] = $null } else { $perNachname[$n] = $voll } }
+        }
+    }
+    $namen = @{}
+    if ($benutzerTab) {
+        foreach ($r in $benutzerTab.Rows) {
+            $b = [string]$r["Benutzer"]
+            if ($perUser.ContainsKey($b)) { $namen[$b] = @{ Name = $perUser[$b]; Scanner = $false } }
+            elseif ($b -match '^MDE\s+(.+)$') {
+                $nn = $matches[1].Trim()
+                $voll = if ($perNachname.ContainsKey($nn) -and $perNachname[$nn]) { $perNachname[$nn] } else { $nn }
+                $namen[$b] = @{ Name = $voll; Scanner = $true }
+            }
+            elseif ($b -eq 'mde') { $namen[$b] = @{ Name = 'Scanner (allgemein)'; Scanner = $true } }
+            else { $namen[$b] = @{ Name = $b; Scanner = $false } }
+        }
+    }
+    return $namen
+}
+
+function Fmt-Platz($kennung, $d1, $d2, $d3) {
+    if ($kennung -is [System.DBNull] -or $null -eq $kennung) { return "" }
+    $a = if ($d1 -is [System.DBNull]) { 0 } else { [int]$d1 }
+    $b = if ($d2 -is [System.DBNull]) { 0 } else { [int]$d2 }
+    $c = if ($d3 -is [System.DBNull]) { 0 } else { [int]$d3 }
+    # Nullen am Ende weglassen: "Regal A 1/2/3", "IASKommlag 7", "Kran H1"
+    if ($c -ne 0) { return "$kennung $a/$b/$c" }
+    if ($b -ne 0) { return "$kennung $a/$b" }
+    if ($a -ne 0) { return "$kennung $a" }
+    return [string]$kennung
+}
+
+# Lagerplatz-Filter der Bewegungen: "Regal A" = ganzes Lager (Kennung beginnt so),
+# "Regal A;1;2;3" = genau dieser Platz (Lagerkennung + Dimension 1-3)
+function Platz-Wert($kennung, $d1, $d2, $d3) {
+    $z = foreach ($d in @($d1, $d2, $d3)) { if ($d -is [System.DBNull] -or $null -eq $d) { 0 } else { [int]$d } }
+    return "$kennung;" + ($z -join ';')
+}
+function Platz-Text($wert) {
+    if ([string]$wert -notlike '*;*') { return [string]$wert }
+    $t = ([string]$wert).Split(';')
+    $z = for ($i = 1; $i -le 3; $i++) { $n = 0; if ($t.Count -gt $i) { [void][int]::TryParse($t[$i], [ref]$n) }; $n }
+    return Fmt-Platz $t[0] $z[0] $z[1] $z[2]
+}
+function Bew-Url($f, $aenderung) {
+    $p = [ordered]@{ von = $f.von.ToString('yyyy-MM-dd'); bis = $f.bis.ToString('yyyy-MM-dd'); typ = $f.typ; wer = $f.wer; art = $f.art; platz = $f.platz }
+    foreach ($k in $aenderung.Keys) { $p[$k] = $aenderung[$k] }
+    $teile = foreach ($k in $p.Keys) { if (-not [string]::IsNullOrEmpty($p[$k])) { "$k=" + [System.Uri]::EscapeDataString([string]$p[$k]) } }
+    return HtmlEncode ("/bewegungen?" + ($teile -join '&'))
+}
+
+function Build-Bewegungen($table, $f, $namen, $max, $fehler) {
+    $head = Page-Head "Lagerbewegungen"
+    $anzahl = 0
+
+    if ($fehler) {
+        $tabelle = "<div class='fehler'>Fehler beim Laden der Daten:<br><pre>$(HtmlEncode $fehler)</pre></div>"
+    } elseif ($null -eq $table -or $table.Rows.Count -eq 0) {
+        $tabelle = "<p style='color:#666'>Keine Buchungen f&uuml;r diese Auswahl gefunden.</p>"
+    } else {
+        $anzahl = $table.Rows.Count
+        $generisch = @('Manuelle Buchungen', 'Manuelle Umbuchung', 'IAS MDE Lagerbuchung', 'Inventurbuchungen')
+        # Filterlinks je Zeile: aktuelle Auswahl ohne den jeweiligen Parameter einmal vorab bauen
+        # (Bew-Url je Zelle waere bei >1000 Zeilen spuerbar langsam)
+        $basis = @{}
+        foreach ($k in 'wer', 'art', 'platz') { $basis[$k] = ([System.Net.WebUtility]::HtmlDecode((Bew-Url $f @{ $k = '' }))) + "&$k=" }
+        # Zellen fuer Person, Artikel und Lagerplatz wiederholen sich oft - je Wert nur einmal bauen
+        $he = [System.Net.WebUtility]
+        $cache = @{}
+        $link = { param($k, $v, $text, $titel)
+            $key = "$k|$v|$text"
+            if (-not $cache.ContainsKey($key)) {
+                $cache[$key] = "<a class='filterlink' href='" + $he::HtmlEncode($basis[$k] + [System.Uri]::EscapeDataString([string]$v)) + "'$titel>" + $he::HtmlEncode($text) + "</a>"
+            }
+            $cache[$key]
+        }
+        $rows = foreach ($r in $table.Rows) {
+            $ba = [string]$r["Bewegungsart"]
+            $meta = if ($BewegungsArten.ContainsKey($ba)) { $BewegungsArten[$ba] } else { @('um', $ba, 'um') }
+            $gruppe = $meta[0]
+
+            $dat = $r["Bewegungsdatum"]
+            $datTxt = if ($dat -is [datetime]) { $dat.ToString("dd.MM.yyyy") } else { "" }
+            $zeit = $r["Zeit"]
+            if ($zeit -is [datetime]) { $datTxt += " <span class='zeit'>$($zeit.ToString('HH:mm'))</span>" }
+
+            $b = [string]$r["Benutzer"]
+            $n = if ($namen.ContainsKey($b)) { $namen[$b] } else { @{ Name = $b; Scanner = $false } }
+            $werTxt = & $link 'wer' $n.Name $n.Name (" title='Sage-Benutzer: " + $he::HtmlEncode($b) + "'")
+            if ($n.Scanner) { $werTxt += " <span class='badge-scan' title='Gebucht mit dem MDE-Scanner'>Scanner</span>" }
+
+            $an = [string]$r["Artikelnummer"]
+            $artTxt = & $link 'art' $an $an ''
+
+            $m = $r["Menge"]
+            $mZahl = if ($m -is [System.DBNull]) { "" } elseif ([math]::Floor($m) -eq $m) { ([decimal]$m).ToString('0') } else { "{0:N2}" -f $m }
+            $mTxt = if ($gruppe -eq 'zu') { "+" + $mZahl } elseif ($gruppe -eq 'ab') { "&minus;" + $mZahl } else { $mZahl }
+
+            $von = ""; $nach = ""
+            if ($r["HKennung"] -isnot [System.DBNull]) { $von = & $link 'platz' (Platz-Wert $r["HKennung"] $r["HD1"] $r["HD2"] $r["HD3"]) (Fmt-Platz $r["HKennung"] $r["HD1"] $r["HD2"] $r["HD3"]) '' }
+            if ($r["ZKennung"] -isnot [System.DBNull]) { $nach = & $link 'platz' (Platz-Wert $r["ZKennung"] $r["ZD1"] $r["ZD2"] $r["ZD3"]) (Fmt-Platz $r["ZKennung"] $r["ZD1"] $r["ZD2"] $r["ZD3"]) '' }
+            $ref = ([string]$r["Referenz"]).Trim()
+            $std = ([string]$r["Standardtext"]).Trim()
+            $memo = ([string]$r["Memo"]).Trim()
+            $bezug = ""
+            if ($ref -match '^\d{4}-\d+$') {
+                $wort = switch ($ba) { { 'EA','ZS' -contains $_ } { 'Lieferschein' } { 'ZR','SR' -contains $_ } { 'R&uuml;cklieferung' } default { 'Wareneingang' } }
+                $name = if ($r["Kunde"] -isnot [System.DBNull]) { [string]$r["Kunde"] } elseif ($r["Lieferant"] -isnot [System.DBNull]) { [string]$r["Lieferant"] } else { "" }
+                $bezug = "$wort $(HtmlEncode $ref)$(if ($name) { " &middot; $(HtmlEncode $name)" })"
+            }
+            elseif ($std -ne '' -and $generisch -notcontains $std) { $bezug = HtmlEncode $std }
+            if ($std -match "'\d{4}-\d+'$" -and $bezug) { $memo = '' }
+            if ($memo -ne '' -and $memo -ne $std -and $generisch -notcontains $memo -and $memo -notmatch '^FA \d+ Bewegungsart') {
+                $bezug += $(if ($bezug) { " &middot; " } else { "" }) + "<span class='memo'>$(HtmlEncode $memo)</span>"
+            }
+
+            "<tr><td style='white-space:nowrap'>$datTxt</td><td style='white-space:nowrap'>$werTxt</td>" +
+            "<td><span class='bew bew-$($meta[2])' title='Sage-Bewegungsart $ba'>$($meta[1])</span></td>" +
+            "<td>$artTxt</td><td>$($he::HtmlEncode([string]$r['Bezeichnung']))</td>" +
+            "<td class='num'>$mTxt</td><td>$von</td><td>$nach</td><td>$bezug</td></tr>"
+        }
+        $hinweis = if ($anzahl -ge $max) { "<p class='hinweis'>Es werden nur die neuesten $max Buchungen angezeigt &ndash; bitte Zeitraum oder Filter eingrenzen.</p>" } else { "" }
+        $tabelle = @"
+$hinweis
+<table id='tab'>
+<thead><tr>
+  <th>Datum</th><th>Wer</th><th>Art</th><th>Artikel</th><th>Bezeichnung</th>
+  <th class='num'>Menge</th><th>Von Lagerplatz</th><th>Nach Lagerplatz</th><th>Bezug</th>
+</tr></thead>
+<tbody>$($rows -join '')</tbody>
+</table>
+"@
+    }
+
+    # Schnellfilter Art und Zeitraum
+    $typLinks = (@(@('', 'Alle'), @('um', 'Umbuchungen'), @('zu', 'Zug&auml;nge'), @('ab', 'Entnahmen')) | ForEach-Object {
+        $cls = if ($_[0] -eq $f.typ) { "btn" } else { "btn btn2" }
+        "<a class='$cls' href='$(Bew-Url $f @{ typ = $_[0] })'>$($_[1])</a>"
+    }) -join " "
+    $heute = (Get-Date).Date
+    $zeitLinks = (@(@(0, 'Heute'), @(6, '7 Tage'), @(29, '30 Tage')) | ForEach-Object {
+        $v = $heute.AddDays(-$_[0])
+        $cls = if ($f.von -eq $v -and $f.bis -eq $heute) { "btn" } else { "btn btn2" }
+        "<a class='$cls' href='$(Bew-Url $f @{ von = $v.ToString('yyyy-MM-dd'); bis = $heute.ToString('yyyy-MM-dd') })'>$($_[1])</a>"
+    }) -join " "
+
+    $personen = @($namen.Values | ForEach-Object { $_.Name } | Sort-Object -Unique)
+    $optionen = "<option value=''>Alle Personen</option>" + (($personen | ForEach-Object {
+        $sel = if ($_ -eq $f.wer) { " selected" } else { "" }
+        "<option value='$(HtmlEncode $_)'$sel>$(HtmlEncode $_)</option>"
+    }) -join '')
+
+    $aktiveFilter = @()
+    if ($f.wer)   { $aktiveFilter += "Person: <b>$(HtmlEncode $f.wer)</b>" }
+    if ($f.art)   { $aktiveFilter += "Artikel: <b>$(HtmlEncode $f.art)</b>" }
+    if ($f.platz) { $aktiveFilter += $(if ($f.platz -like '*;*') { "Lagerplatz: <b>$(HtmlEncode (Platz-Text $f.platz))</b>" } else { "Lager: <b>$(HtmlEncode $f.platz)</b>" }) }
+    $filterZeile = if ($aktiveFilter.Count -gt 0) {
+        "<div class='aktivfilter'>Gefiltert nach $($aktiveFilter -join ', ') &middot; <a href='$(Bew-Url $f @{ wer = ''; art = ''; platz = '' })'>Filter entfernen</a></div>"
+    } else { "" }
+
+    return @"
+$head
+<style>
+.bew { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; white-space:nowrap; }
+.bew-um  { background:#e8f4fd; color:#086ED5; }
+.bew-zu  { background:#e8f5e9; color:#1b5e20; }
+.bew-ab  { background:#fdecea; color:#b71c1c; }
+.bew-inv { background:#eceff1; color:#455a64; }
+.badge-scan { display:inline-block; padding:0 6px; border-radius:8px; font-size:10px; font-weight:600; background:#f3e5f5; color:#6a1b9a; vertical-align:middle; }
+.zeit { color:#888; font-size:12px; }
+.memo { color:#888; font-size:12px; }
+a.filterlink { color:inherit; text-decoration:none; border-bottom:1px dotted #9aa5b1; }
+a.filterlink:hover { color:#086ED5; border-bottom-color:#086ED5; }
+.bewform { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:12px; }
+.bewform input[type=date] { padding:7px 8px; border:1px solid #ccc; border-radius:999px; font-family:inherit; font-size:14px; }
+.bewform .suche { max-width:230px; }
+.bewform .autobox { max-width:380px; }
+.bewform .autobox .suche { max-width:none; }
+.bewform select { min-width:200px; padding:8px 14px; border:1px solid #d6d8db; border-radius:999px; background:#fff; color:#343A40; font-family:inherit; font-size:14px; }
+.aktivfilter { background:#fff8e1; border:1px solid #ffe082; padding:7px 12px; border-radius:6px; font-size:13px; margin-bottom:12px; }
+.hinweis { color:#b26a00; font-size:13px; margin:0 0 8px; }
+.trenner { width:10px; }
+</style>
+<div class='kopf'>
+  <h1>Lagerbewegungen</h1>
+  <div class='meta'>$(StandText) &middot; $anzahl Buchungen</div>
+</div>
+<div class='steuer'>
+  $zeitLinks
+  <span class='trenner'></span>
+  $typLinks
+</div>
+<form class='bewform' method='get' action='/bewegungen'>
+  <input type='hidden' name='typ' value='$(HtmlEncode $f.typ)'>
+  <label>von <input type='date' name='von' value='$($f.von.ToString('yyyy-MM-dd'))'></label>
+  <label>bis <input type='date' name='bis' value='$($f.bis.ToString('yyyy-MM-dd'))'></label>
+  <select name='wer' onchange='this.form.submit()'>$optionen</select>
+  <div class='autobox'>
+    <input class='suche' id='artsuche' name='art' autocomplete='off' value='$(HtmlEncode $f.art)' placeholder='Artikel'
+           oninput='vorschlage()' onkeydown='navi(event)'>
+    <div class='vorschlaege' id='vorschlaege'></div>
+  </div>
+  <div class='autobox'>
+    <input class='suche' id='platzsuche' autocomplete='off' value='$(HtmlEncode (Platz-Text $f.platz))' placeholder='Lagerplatz'
+           oninput='platzVorschlage()' onkeydown='platzNavi(event)'>
+    <input type='hidden' name='platz' id='platzwert' value='$(HtmlEncode $f.platz)'>
+    <div class='vorschlaege' id='platzvorschlaege'></div>
+  </div>
+  <button class='btn' type='submit'>Anzeigen</button>
+</form>
+$filterZeile
+$tabelle
+<script>
+var timer = null, selIdx = -1;
+function vorschlage() {
+  var q = document.getElementById('artsuche').value.trim();
+  if (timer) clearTimeout(timer);
+  if (q.length < 2) { schliesse(); return; }
+  timer = setTimeout(function () {
+    fetch('/api/artikelsuche?q=' + encodeURIComponent(q))
+      .then(function (r) { return r.json(); })
+      .then(zeige)
+      .catch(schliesse);
+  }, 200);
+}
+function zeige(daten) {
+  var box = document.getElementById('vorschlaege');
+  selIdx = -1; box.textContent = '';
+  if (!daten || daten.length === 0) { schliesse(); return; }
+  daten.forEach(function (d) {
+    var div = document.createElement('div'), nr = document.createElement('span'), bez = document.createElement('span');
+    div.setAttribute('data-nr', d.nr); nr.className = 'nr'; nr.textContent = d.nr; bez.textContent = d.bez;
+    div.appendChild(nr); div.appendChild(bez);
+    div.onclick = function () { waehle(d.nr); };
+    box.appendChild(div);
+  });
+  box.style.display = 'block';
+}
+function schliesse() { var box = document.getElementById('vorschlaege'); box.style.display = 'none'; box.textContent = ''; selIdx = -1; }
+function waehle(nr) { var ein = document.getElementById('artsuche'); ein.value = nr; schliesse(); ein.form.submit(); }
+function navi(e) {
+  var items = document.getElementById('vorschlaege').querySelectorAll('div');
+  if (e.key === 'Enter' && selIdx >= 0 && items[selIdx]) { e.preventDefault(); waehle(items[selIdx].getAttribute('data-nr')); }
+  else if (e.key === 'ArrowDown' && items.length) { e.preventDefault(); if (selIdx < items.length - 1) selIdx++; markiere(items); }
+  else if (e.key === 'ArrowUp' && items.length) { e.preventDefault(); if (selIdx > 0) selIdx--; markiere(items); }
+  else if (e.key === 'Escape') { schliesse(); }
+}
+function markiere(items) { for (var i = 0; i < items.length; i++) items[i].className = (i === selIdx) ? 'sel' : ''; }
+document.addEventListener('click', function (e) { if (!e.target.closest('.autobox')) schliesse(); });
+// Lagerplatz: Vorschlaege "ganzes Lager" und einzelne Plaetze; Wert (Kennung;D1;D2;D3) im versteckten Feld
+var pTimer = null, pSel = -1;
+function platzVorschlage() {
+  var q = document.getElementById('platzsuche').value.trim();
+  document.getElementById('platzwert').value = q;   // frei getippt = ganzes Lager mit diesem Anfang
+  if (pTimer) clearTimeout(pTimer);
+  if (q.length < 2) { platzSchliesse(); return; }
+  pTimer = setTimeout(function () {
+    fetch('/api/lagerplatzsuche?mit=alle&q=' + encodeURIComponent(q))
+      .then(function (r) { return r.json(); }).then(platzZeige).catch(platzSchliesse);
+  }, 200);
+}
+function platzZeige(daten) {
+  var box = document.getElementById('platzvorschlaege');
+  pSel = -1; box.textContent = '';
+  if (!daten || daten.length === 0) { platzSchliesse(); return; }
+  daten.forEach(function (d) {
+    var div = document.createElement('div'), t = document.createElement('span');
+    div.setAttribute('data-v', d.v); div.setAttribute('data-t', d.t);
+    t.textContent = d.t; div.appendChild(t);
+    if (d.g) { var z = document.createElement('span'); z.textContent = ' ganzes Lager'; z.style.color = '#888'; div.appendChild(z); }
+    div.onclick = function () { platzWaehle(d.v, d.t); };
+    box.appendChild(div);
+  });
+  box.style.display = 'block';
+}
+function platzSchliesse() { var box = document.getElementById('platzvorschlaege'); box.style.display = 'none'; box.textContent = ''; pSel = -1; }
+function platzWaehle(v, t) { document.getElementById('platzsuche').value = t; document.getElementById('platzwert').value = v; platzSchliesse(); document.getElementById('platzwert').form.submit(); }
+function platzNavi(e) {
+  var items = document.getElementById('platzvorschlaege').querySelectorAll('div');
+  if (e.key === 'Enter' && pSel >= 0 && items[pSel]) { e.preventDefault(); platzWaehle(items[pSel].getAttribute('data-v'), items[pSel].getAttribute('data-t')); }
+  else if (e.key === 'ArrowDown' && items.length) { e.preventDefault(); if (pSel < items.length - 1) pSel++; for (var i = 0; i < items.length; i++) items[i].className = (i === pSel) ? 'sel' : ''; }
+  else if (e.key === 'ArrowUp' && items.length) { e.preventDefault(); if (pSel > 0) pSel--; for (var j = 0; j < items.length; j++) items[j].className = (j === pSel) ? 'sel' : ''; }
+  else if (e.key === 'Escape') { platzSchliesse(); }
+}
+document.addEventListener('click', function (e) { if (!e.target.closest('.autobox')) platzSchliesse(); });
+</script>
+</body></html>
+"@
+}
+
 # ---------- Dienst ----------
 if ($MyInvocation.InvocationName -eq '.') { return }   # dot-gesourct (Test): nur Funktionen laden
 
@@ -1930,6 +2274,75 @@ while ($listener.IsListening) {
                 $tab = Run-Query $sql @{ "@suche" = "%$q%"; "@anfang" = "$q%" }
                 $ausgabe = "[" + ((@($tab.Rows) | ForEach-Object { "{""nr"":""$(JsEncode $_['Artikelnummer'])"",""bez"":""$(JsEncode $_['Bezeichnung'])""}" }) -join ",") + "]"
             } catch { $ausgabe = "[]" }
+        } elseif ($pfad -eq "/api/lagerplatzsuche") {
+            # Autovervollstaendigung Lagerplatz (ganze Lager + einzelne Plaetze): JSON
+            $contentType = "application/json; charset=utf-8"
+            $qLpClean = ([string](Parse-Query $query "q")) -replace "[';]", ""
+            # ganze Lager + alle Plaetze (auch ohne Bestand), Treffer auch auf "A 1/2"
+            try {
+                $teile = New-Object System.Collections.ArrayList
+                foreach ($r in (Run-Query "SELECT TOP 5 Lagerkennung FROM KHKLagerorte WHERE Mandant = $Mandant AND Lagerkennung LIKE @s ORDER BY Lagerkennung" @{ "@s" = "%$qLpClean%" }).Rows) {
+                    [void]$teile.Add("{""v"":""$(JsEncode $r['Lagerkennung'])"",""t"":""$(JsEncode $r['Lagerkennung'])"",""g"":1}")
+                }
+                $sqlPl = @"
+SELECT TOP 20 Lagerkennung AS K, ISNULL(Dimension1, 0) AS D1, ISNULL(Dimension2, 0) AS D2, ISNULL(Dimension3, 0) AS D3
+FROM KHKLagerplaetze
+WHERE Mandant = $Mandant
+  AND (Lagerkennung + ' ' + CAST(ISNULL(Dimension1, 0) AS varchar) + '/' + CAST(ISNULL(Dimension2, 0) AS varchar) + '/' + CAST(ISNULL(Dimension3, 0) AS varchar)) LIKE @s
+  AND NOT (ISNULL(Dimension1, 0) = 0 AND ISNULL(Dimension2, 0) = 0 AND ISNULL(Dimension3, 0) = 0)
+ORDER BY Lagerkennung, ISNULL(Dimension1, 0), ISNULL(Dimension2, 0), ISNULL(Dimension3, 0)
+"@
+                foreach ($r in (Run-Query $sqlPl @{ "@s" = "%$qLpClean%" }).Rows) {
+                    [void]$teile.Add("{""v"":""$(JsEncode (Platz-Wert $r['K'] $r['D1'] $r['D2'] $r['D3']))"",""t"":""$(JsEncode (Fmt-Platz $r['K'] $r['D1'] $r['D2'] $r['D3']))""}")
+                }
+                $ausgabe = "[" + ($teile -join ",") + "]"
+            } catch { $ausgabe = "[]" }
+        } elseif ($pfad -eq "/bewegungen") {
+            # --- Lagerbewegungsprotokoll: wer hat wann was wohin gebucht ---
+            # Werte kommen aus einem GET-Formular: "+" steht fuer Leerzeichen
+            $fw = { param($n) if ($query -match "(^|[?&])$n=([^&]*)") { ([System.Uri]::UnescapeDataString($matches[2].Replace('+', ' '))).Trim() } else { "" } }
+            $heute = (Get-Date).Date
+            $f = @{ von = $heute.AddDays(-6); bis = $heute; typ = (& $fw 'typ'); wer = (& $fw 'wer'); art = (& $fw 'art'); platz = (& $fw 'platz') }
+            $d = [datetime]::MinValue
+            if ([datetime]::TryParseExact((& $fw 'von'), 'yyyy-MM-dd', $null, 'None', [ref]$d)) { $f.von = $d }
+            if ([datetime]::TryParseExact((& $fw 'bis'), 'yyyy-MM-dd', $null, 'None', [ref]$d)) { $f.bis = $d }
+            if ($f.bis -lt $f.von) { $t = $f.von; $f.von = $f.bis; $f.bis = $t }
+            if (@('um','zu','ab') -notcontains $f.typ) { $f.typ = '' }
+            $max = 2000
+            $namen = @{}
+            try {
+                # Namensliste aendert sich selten - 15 Minuten zwischenspeichern
+                if ($null -eq $script:BewNamenCache -or ((Get-Date) - $script:BewNamenZeit).TotalMinutes -gt 15) {
+                    $script:BewNamenCache = Get-BenutzerNamen (Run-Query $SQL_BewegungenBenutzer $null) (Run-Query $SQL_MitarbeiterNamen $null)
+                    $script:BewNamenZeit = Get-Date
+                }
+                $namen = $script:BewNamenCache
+                $p = @{ "@max" = $max; "@von" = $f.von; "@bis" = $f.bis.AddDays(1) }
+                $filter = @()
+                if ($f.typ) {
+                    $codes = @($BewegungsArten.Keys | Where-Object { $BewegungsArten[$_][0] -eq $f.typ } | ForEach-Object { "'$_'" }) -join ','
+                    $filter += "AND b.Bewegungsart IN ($codes)"
+                }
+                if ($f.art)   { $filter += "AND (b.Artikelnummer LIKE @art + '%' OR a.Bezeichnung1 LIKE '%' + @art + '%')"; $p["@art"] = $f.art }
+                if ($f.platz -like '*;*') {
+                    # genau ein Platz: Lagerkennung + Dimension 1-3 (Herkunft oder Ziel)
+                    $tp = $f.platz.Split(';'); $p["@pk"] = $tp[0]
+                    for ($i = 1; $i -le 3; $i++) { $n = 0; if ($tp.Count -gt $i) { [void][int]::TryParse($tp[$i], [ref]$n) }; $p["@pd$i"] = $n }
+                    $filter += "AND ((hp.Lagerkennung = @pk AND ISNULL(hp.Dimension1, 0) = @pd1 AND ISNULL(hp.Dimension2, 0) = @pd2 AND ISNULL(hp.Dimension3, 0) = @pd3) OR (zp.Lagerkennung = @pk AND ISNULL(zp.Dimension1, 0) = @pd1 AND ISNULL(zp.Dimension2, 0) = @pd2 AND ISNULL(zp.Dimension3, 0) = @pd3))"
+                } elseif ($f.platz) { $filter += "AND (hp.Lagerkennung LIKE @platz + '%' OR zp.Lagerkennung LIKE @platz + '%')"; $p["@platz"] = $f.platz }
+                if ($f.wer) {
+                    # Eine Person kann mehrere Sage-Benutzer haben (Kuerzel und Scanner)
+                    $codes = @($namen.Keys | Where-Object { $namen[$_].Name -eq $f.wer })
+                    if ($codes.Count -eq 0) { $codes = @($f.wer) }
+                    $platzhalter = for ($i = 0; $i -lt $codes.Count; $i++) { $p["@w$i"] = $codes[$i]; "@w$i" }
+                    $filter += "AND j.Benutzer IN ($($platzhalter -join ','))"
+                }
+                $sql = $SQL_Bewegungen -replace '\{FILTER\}', ($filter -join "`n  ")
+                $tab = Run-Query $sql $p
+                $ausgabe = Build-Bewegungen $tab $f $namen $max $null
+            } catch {
+                $ausgabe = Build-Bewegungen $null $f $namen $max ($_.Exception.ToString())
+            }
         } elseif ($pfad -eq "/datei") {
             # Datei aus der Sage-Sammelmappe ausliefern - nur Pfade, die in KHKSammelmappen stehen
             $dId = 0; [void][int]::TryParse(((Parse-Query $query "id") -replace '[^0-9]', ''), [ref]$dId)
