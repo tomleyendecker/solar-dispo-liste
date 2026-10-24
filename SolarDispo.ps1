@@ -125,35 +125,55 @@ function Get-Kalender {
 # Vornamen, ist es eine andere Person. Sicher = auch der Vorname steht im Titel (oder Firma).
 $FirmenMuster = '(?i)gmbh|gbr|\bkg\b|\bag\b|e\.v\.|stiftung|verwaltung|beteiligung|\bohg\b|\bug\b'
 $NamenStopp = @('gmbh', 'und', 'co', 'kg', 'gbr', 'grundstuecks', 'beteiligungs', 'verwaltungs', 'energie', 'solar', 'herr', 'frau', 'familie', 'eheleute')
-function Kunden-Termine($name, $termine) {
-    $woerter = @(((Name-Norm $name) -split '[^a-z]+') | Where-Object { $_.Length -ge 3 -and $NamenStopp -notcontains $_ })
-    if ($woerter.Count -eq 0) { return @() }
-    $firma = ([string]$name -match $FirmenMuster)
-    # Person: Nachname = letztes Wort ("Jenny und Julian Alloway" -> alloway), bei "Nachname, Vorname" das erste
-    $vorname = $null; $nach = $woerter
-    if (-not $firma -and $woerter.Count -ge 2) {
-        if ([string]$name -match ',') { $nach = @($woerter[0]); $vorname = $woerter[1] }
-        else { $nach = @($woerter[-1]); $vorname = $woerter[0] }
+# Kundenname in (Vorname, Nachname)-Paare: "Peter Mueller und Helga Schmidt" -> peter/mueller + helga/schmidt,
+# "Jenny und Julian Alloway" -> jenny/alloway + julian/alloway, "Nachname, Vorname" -> vorname/nachname.
+# Firmen: jedes Namenswort einzeln (ohne Vorname).
+function Name-Paare($name) {
+    $norm = Name-Norm $name
+    $sig = { param($x) @(([string]$x -split '[^a-z]+') | Where-Object { $_.Length -ge 3 -and $NamenStopp -notcontains $_ }) }
+    if ([string]$name -match $FirmenMuster) { return @{ Firma = $true; Paare = @(& $sig $norm | ForEach-Object { @{ V = $null; N = $_ } }) } }
+    if ([string]$name -match ',') {
+        $w = @(& $sig $norm); if (-not $w.Count) { return @{ Firma = $false; Paare = @() } }
+        return @{ Firma = $false; Paare = @(@{ V = $(if ($w.Count -ge 2) { $w[1] } else { $null }); N = $w[0] }) }
     }
+    $teile = New-Object System.Collections.ArrayList
+    foreach ($t in ($norm -split '\s+(?:und|u\.|&|\+)\s+|\s*/\s*')) { $w = @(& $sig $t); if ($w.Count) { [void]$teile.Add($w) } }
+    $nachLetzt = $null; foreach ($t in $teile) { if ($t.Count -ge 2) { $nachLetzt = $t[$t.Count - 1] } }
+    $paare = foreach ($t in $teile) {
+        if ($t.Count -ge 2) { @{ V = $(if ($t[0] -ne $t[$t.Count - 1]) { $t[0] } else { $null }); N = $t[$t.Count - 1] } }
+        elseif ($nachLetzt) { @{ V = $(if ($t[0] -ne $nachLetzt) { $t[0] } else { $null }); N = $nachLetzt } }
+        else { @{ V = $null; N = $t[0] } }
+    }
+    return @{ Firma = $false; Paare = @($paare) }
+}
+function Kunden-Termine($name, $termine) {
+    $np = Name-Paare $name
+    if (-not $np.Paare.Count) { return @() }
     $erg = foreach ($t in $termine) {
-        $passt = $false
-        foreach ($n in $nach) {
-            if ($t.Norm -match "\b$n\b") {
-                $passt = $true
-                # "Nachname, Vorname" mit anderem, grossgeschriebenem Vornamen = andere Person ("Schmitz, Bodo");
-                # kleingeschrieben ist es Text ("Halama, nach Dachsanierung")
-                if ($vorname -and $t.Fall -match "(?i)\b$n,\s*([A-Za-z]+)" -and [char]::IsUpper($matches[1][0]) -and $matches[1].ToLower() -ne $vorname) { $passt = $false }
+        $passt = $false; $sicher = $false
+        foreach ($p in $np.Paare) {
+            $n = $p.N; if ($t.Norm -notmatch "\b$n\b") { continue }
+            if ($t.Fall -match "(?i)\b$n,\s*([A-Za-z]+)(.?)" -and [char]::IsUpper($matches[1][0])) {
+                $wort = $matches[1]
+                # "Nachname, Vorname" mit anderem Vornamen = andere Person ("Schmitz, Bodo"); kleingeschrieben ist es Text ("Halama, nach ...")
+                if ($p.V -and $wort.ToLower() -ne $p.V) { continue }
+                # bei Firmen ist "Mueller, Peter (Fronius)" eine Person, "Gallhoefer, Abbau und Neuinstallation" aber nicht
+                if ($np.Firma -and $t.Fall -match "(?i)\b$n,\s*$wort\s*(?:$|[(,\-]|\u2013|\u2014)") { continue }
             }
+            $passt = $true
+            if ($np.Firma -or ($p.V -and $t.Norm -match "\b$($p.V)\b")) { $sicher = $true }
         }
-        if ($passt) { [pscustomobject]@{ T = $t; Sicher = ($firma -or ($vorname -and $t.Norm -match "\b$vorname\b")) } }
+        if ($passt) { [pscustomobject]@{ T = $t; Sicher = $sicher } }
     }
     return @($erg)
 }
-
 # Modulleistung in Watt aus der Bezeichnung einer Modulposition (Artikelgruppe 50), z.B. "LUXOR Eco Line M108 465W"
 function Modul-Wp($gruppe, $bez) {
     if ([string]$gruppe -ne '50') { return $null }
     if ([string]$bez -match '(\d{3})\s*Wp?\b') { return [int]$matches[1] }
+    # ohne "W" in der Bezeichnung (z.B. "Jinko JKM 370 N-6TL3-B", "CS3L-370", "Aiko A490"): dreistellige Zahl 300-699
+    $m = [regex]::Match([string]$bez, '(?<!\d)([3-6]\d\d)(?!\d)')
+    if ($m.Success) { return [int]$m.Groups[1].Value }
     return $null
 }
 function Fmt-kWp($k) { if (-not $k) { return "" }; return ([math]::Round($k, 1)).ToString('0.#', [Globalization.CultureInfo]'de-DE') + " kWp" }
@@ -418,6 +438,7 @@ details summary { cursor:pointer; }
 </head>
 <body>
 <nav class='hauptnav'><a class='marke' href='/'><img src='/static/logo.svg' alt='Leyendecker Solar'><span>Dispo</span></a>
+  <a class='nav$(if ($pfad -eq '/dashboard') { ' aktiv' })' href='/dashboard'>Dashboard</a>
   <a class='nav$(if ($pfad -eq '/' -or $pfad -eq '/auftrag') { ' aktiv' })' href='/'>Offene Auftr&auml;ge</a>
   <a class='nav$(if ($pfad -eq '/material') { ' aktiv' })' href='/material'>Materialbedarf</a>
   <a class='nav$(if ($pfad -eq '/angebote') { ' aktiv' })' href='/angebote'>Angebote</a>
@@ -3339,19 +3360,16 @@ function CN-Finde($cn, $name1, $kto, $plzListe, $strasse) {
     }
     if ($k.Count) { return @{ P = (& $wahl $k)[0]; Sicher = $true; Wie = 'E-Mail'; Anzahl = $k.Count } }
     # 2. Nachname + PLZ (Firmen: ein Namenswort + PLZ)
-    $woerter = @(((Name-Norm $name1) -split '[^a-z]+') | Where-Object { $_.Length -ge 3 -and $NamenStopp -notcontains $_ })
-    if (-not $woerter.Count) { return $null }
-    $firma = ([string]$name1 -match $FirmenMuster)
-    $nach = if ($firma) { $woerter } elseif ([string]$name1 -match ',') { @($woerter[0]) } else { @($woerter[-1]) }
-    $vor = if (-not $firma -and $woerter.Count -ge 2) { if ([string]$name1 -match ',') { $woerter[1] } else { $woerter[0] } } else { $null }
+    $np = Name-Paare $name1
+    if (-not $np.Paare.Count) { return $null }
     $k = New-Object System.Collections.ArrayList
     foreach ($plz in @($plzListe | Where-Object { $_ } | ForEach-Object { ([string]$_).Trim() } | Select-Object -Unique)) {
         if (-not $cn.NachPlz.ContainsKey($plz)) { continue }
-        foreach ($p in $cn.NachPlz[$plz]) { foreach ($n in $nach) { if ($p.Norm -match "\b$n\b" -and -not $k.Contains($p)) { [void]$k.Add($p) } } }
+        foreach ($p in $cn.NachPlz[$plz]) { foreach ($pp in $np.Paare) { if ($p.Norm -match "\b$($pp.N)\b" -and -not $k.Contains($p)) { [void]$k.Add($p) } } }
     }
     if ($k.Count -eq 0) { return $null }
     $k = @($k)
-    if ($k.Count -gt 1 -and $vor) { $v = @($k | Where-Object { $_.Norm -match "\b$vor\b" }); if ($v.Count) { $k = $v } }
+    if ($k.Count -gt 1) { $v = @($k | Where-Object { $pn = $_.Norm; @($np.Paare | Where-Object { $_.V -and $pn -match "\b$($_.V)\b" -and $pn -match "\b$($_.N)\b" }).Count }); if ($v.Count) { $k = $v } }
     if ($k.Count -gt 1 -and $strasse) {
         $sn = (Name-Norm $strasse) -replace '[^a-z]', ''
         if ($sn.Length -ge 4) { $an = $sn.Substring(0, [math]::Min(8, $sn.Length)); $s = @($k | Where-Object { ($_.Strasse -replace '[^a-z]', '') -like "$an*" }); if ($s.Count) { $k = $s } }
@@ -3528,6 +3546,354 @@ $(& $tab "<th>Auftrag</th><th>Kunde</th><th>Baustelle</th><th>Montage</th>" $row
 </body></html>
 "@
 }
+
+
+# ---------- Dashboard: montierte und geplante Leistung ----------
+# Montiert = Module (Artikelgruppe 50) auf Lieferscheinen (Ruecklieferschein abgezogen), Datum = Lieferscheindatum.
+# Nur Vorgaenge mit Montage (Dach- oder Elektromontage, Gruppe 12/14) - reine Modulverkaeufe (z.B. an Haendler) zaehlen nicht.
+# Geplant = offene Modulmenge der offenen Auftraege (mit Montage), Termin = naechster Montagetermin, sonst Liefertermin.
+# Leistung je Modul aus der Bezeichnung (Modul-Wp) - Sage hat dafuer kein eigenes Feld.
+$SQL_DashMontiert = @"
+SELECT k.VorID, k.BelID, CAST(k.Belegjahr AS varchar) + '-' + CAST(k.Belegnummer AS varchar) AS Beleg, k.Belegdatum, k.Belegart, k.A0Name1 AS Kunde,
+       p.MengeBasis AS Menge, p.Bezeichnung1 AS PosBez, a.Bezeichnung1 AS ArtBez, a.Artikelgruppe, a.Stuecklistentyp
+FROM KHKVKBelege k
+INNER JOIN KHKVKBelegePositionen p ON p.BelID = k.BelID AND p.Mandant = k.Mandant
+INNER JOIN KHKArtikel a ON a.Artikelnummer = p.Artikelnummer AND a.Mandant = p.Mandant
+WHERE k.Mandant = $Mandant AND k.Belegart LIKE '%lieferschein' AND p.PosType = 1 AND k.Belegdatum >= @von
+  AND a.Artikelgruppe IN ('50', '60', '64')
+  AND EXISTS (SELECT 1 FROM KHKVKVorgaengePositionen vm INNER JOIN KHKArtikel am ON am.Artikelnummer = vm.Artikelnummer AND am.Mandant = vm.Mandant
+              WHERE vm.Mandant = k.Mandant AND vm.VorID = k.VorID AND am.Artikelgruppe IN ('12', '14'))
+"@
+$SQL_DashMontageVorgaenge = @"
+SELECT DISTINCT vp.VorID FROM KHKVKVorgaengePositionen vp
+INNER JOIN KHKArtikel a ON a.Artikelnummer = vp.Artikelnummer AND a.Mandant = vp.Mandant
+WHERE vp.Mandant = $Mandant AND a.Artikelgruppe IN ('12', '14')
+"@
+
+function Build-Dashboard($fehler) {
+    $head = Page-Head "Solar Dispo - Dashboard"
+    if ($fehler) { return "$head<div class='fehler'>Fehler beim Laden der Daten:<br><pre>$(HtmlEncode $fehler)</pre></div></body></html>" }
+    $de = [Globalization.CultureInfo]'de-DE'; $inv = [Globalization.CultureInfo]::InvariantCulture
+    $heute = (Get-Date).Date; $jahr = $heute.Year
+    $monat0 = (New-Object DateTime $heute.Year, $heute.Month, 1).AddMonths(-24)
+    $von = [datetime]::new([math]::Min($monat0.Year, $jahr - 2), 1, 1); if ($monat0 -lt $von) { $von = $monat0 }
+    $kw = { param($x) ([math]::Round([double]$x, 1)).ToString('#,##0.#', $de) }
+    $js = { param($x) ConvertTo-JsonText $x }
+    $num = { param($x) ([math]::Round([double]$x, 2)).ToString($inv) }
+
+    # --- montiert (Vergangenheit)
+    $monate = [ordered]@{}
+    for ($m = $von; $m -le $heute.AddMonths(12); $m = $m.AddMonths(1)) { $monate[$m.ToString('yyyy-MM')] = @{ Start = $m; Montiert = 0.0; Anl = [ordered]@{}; Termin = 0.0; Liefer = 0.0; Au = (New-Object System.Collections.ArrayList) } }
+    $ohneWp = 0.0
+    foreach ($r in (Run-Query $SQL_DashMontiert @{ "@von" = $von }).Rows) {
+        $d = ([datetime]$r['Belegdatum']).Date; $key = $d.ToString('yyyy-MM'); if (-not $monate.Contains($key)) { continue }
+        $vz = if ([string]$r['Belegart'] -like 'R*') { -1 } else { 1 }
+        $vor = [string]$r['VorID']; $g = [string]$r['Artikelgruppe']
+        $bez = ([string]$r['PosBez']).Trim(); if (-not $bez) { $bez = [string]$r['ArtBez'] }
+        $mo = $monate[$key]
+        if (-not $mo.Anl.Contains($vor)) { $mo.Anl[$vor] = @{ Kunde = [string]$r['Kunde']; kWp = 0.0; Speicher = $false; Wallbox = $false; Tage = @{} } }
+        $a = $mo.Anl[$vor]
+        if ($g -eq '50') {
+            $wp = Modul-Wp $g $bez; if (-not $wp) { $wp = Modul-Wp $g ([string]$r['ArtBez']) }
+            if (-not $wp) { $ohneWp += $vz * [double]$r['Menge']; continue }
+            $k = $vz * [double]$r['Menge'] * $wp / 1000; $mo.Montiert += $k; $a.kWp += $k; $a.Tage[$d] = 1
+        } elseif ($g -eq '64') { $a.Wallbox = $true }
+        elseif ((ToNum $r['Stuecklistentyp']) -eq 2 -or $bez -match '(?i)batter|speicher|reserva') { $a.Speicher = $true }
+    }
+    # Anlagen = Vorgaenge mit Modulleistung im Monat
+    foreach ($mo in $monate.Values) { foreach ($k in @($mo.Anl.Keys)) { if ($mo.Anl[$k].kWp -le 0.01) { $mo.Anl.Remove($k) } } }
+    # kWp je Zeitraum ueber die Lieferscheindaten (genau auf den Tag, fuer den Vorjahresvergleich)
+    $zeitraum = { param($ab, $bis)
+        $s = 0.0; $v = @{}
+        foreach ($mo in $monate.Values) {
+            if ($mo.Start.AddMonths(1) -le $ab -or $mo.Start -gt $bis) { continue }
+            foreach ($k in $mo.Anl.Keys) {
+                $a = $mo.Anl[$k]; $tage = @($a.Tage.Keys | Where-Object { $_ -ge $ab -and $_ -le $bis })
+                if ($tage.Count) { $anteil = $tage.Count / $a.Tage.Count; $s += $a.kWp * $anteil; $v[$k] = 1 }
+            }
+        }
+        @{ kWp = $s; Anlagen = $v.Count } }
+    $ytd = & $zeitraum (New-Object DateTime $jahr, 1, 1) $heute
+    $vjTag = $heute.AddYears(-1); $vjYtd = & $zeitraum (New-Object DateTime ($jahr - 1), 1, 1) $vjTag
+    $l12 = & $zeitraum $heute.AddDays(-364) $heute
+
+    # --- geplant (offene Auftraege mit Montage)
+    $liste = @(Get-Auftraege)
+    $mitMontage = @{}; foreach ($r in (Run-Query $SQL_DashMontageVorgaenge $null).Rows) { $mitMontage[[string]$r['VorID']] = 1 }
+    $offen = @($liste | Where-Object { $_.kWp -gt 0 -and $mitMontage.ContainsKey([string]$_.VorID) })
+    $ueberf = New-Object System.Collections.ArrayList; $ohneTermin = New-Object System.Collections.ArrayList
+    foreach ($au in $offen) {
+        if ($au.Naechster) { $d = $au.Naechster.T.Start.Date; $typ = 'Termin' }
+        elseif ($au.Liefertermin -and $au.Liefertermin.Date -ge $heute) { $d = $au.Liefertermin.Date; $typ = 'Liefer' }
+        elseif ($au.Liefertermin) { [void]$ueberf.Add($au); continue }
+        else { [void]$ohneTermin.Add($au); continue }
+        $key = $d.ToString('yyyy-MM'); if (-not $monate.Contains($key)) { continue }
+        $monate[$key].$typ += $au.kWp; [void]$monate[$key].Au.Add(@{ Au = $au; Datum = $d; Typ = $typ })
+    }
+    $mitTermin = @($offen | Where-Object { $_.Naechster })
+    $in4 = @($offen | Where-Object { $_.Naechster -and $_.Naechster.T.Start.Date -le $heute.AddDays(27) })
+    $in4Fehlt = @($in4 | Where-Object { @($_.Material | Where-Object { $_.Status -eq 'fehlt' }).Count })
+    $sumKwp = { param($l) $s = 0.0; foreach ($x in $l) { $s += $x.kWp }; $s }
+
+    # --- offene Angebote (3 Monate, ohne spaeteren Auftrag)
+    $ang = @{}
+    foreach ($r in (Run-Query $SQL_OffeneAngebote @{ "@von" = $heute.AddMonths(-3) }).Rows) {
+        if ($r['AuftragDanach'] -isnot [System.DBNull]) { continue }
+        $id = [string]$r['BelID']; if (-not $ang.ContainsKey($id)) { $ang[$id] = 0.0 }
+        $wp = Modul-Wp ([string]$r['Artikelgruppe']) ([string]$r['PosBezeichnung']); if ($wp) { $ang[$id] += [double](ToNum $r['Menge']) * $wp / 1000 }
+    }
+    $angKwp = 0.0; foreach ($v in $ang.Values) { $angKwp += $v }
+
+    # --- Monatsdaten fuer das Diagramm (24 Monate zurueck, 12 voraus)
+    $mJson = New-Object System.Collections.ArrayList
+    $erster = (New-Object DateTime $heute.Year, $heute.Month, 1).AddMonths(-24)
+    foreach ($key in $monate.Keys) {
+        $mo = $monate[$key]; if ($mo.Start -lt $erster) { continue }
+        $vjKey = $mo.Start.AddYears(-1).ToString('yyyy-MM'); $vj = if ($monate.Contains($vjKey) -and $mo.Start -le $heute) { $monate[$vjKey].Montiert } else { $null }
+        $tip = "<b>$($de.DateTimeFormat.GetMonthName($mo.Start.Month)) $($mo.Start.Year)</b>"
+        if ($mo.Montiert -ne 0) {
+            $sp = @($mo.Anl.Values | Where-Object { $_.Speicher }).Count; $wb = @($mo.Anl.Values | Where-Object { $_.Wallbox }).Count
+            $tip += "<div class='tz'><i style='background:#FFBC00'></i>montiert <b>$(& $kw $mo.Montiert) kWp</b> &middot; $($mo.Anl.Count) Anlagen$(if ($sp) { ", $sp mit Speicher" })$(if ($wb) { ", $wb mit Wallbox" })</div>"
+            $tip += (@($mo.Anl.Values | Sort-Object { - $_.kWp } | Select-Object -First 8 | ForEach-Object { "<div class='td'><span>$(HtmlEncode $_.Kunde)</span><span>$(& $kw $_.kWp)</span></div>" })) -join ''
+            if ($mo.Anl.Count -gt 8) { $tip += "<div class='td leise'>&hellip; $($mo.Anl.Count - 8) weitere</div>" }
+        }
+        if ($null -ne $vj) { $tip += "<div class='tz leise'>Vorjahresmonat $(& $kw $vj) kWp</div>" }
+        if ($mo.Termin + $mo.Liefer -gt 0) {
+            if ($mo.Termin -gt 0) { $tip += "<div class='tz'><i style='background:#343A40'></i>geplant mit Montagetermin <b>$(& $kw $mo.Termin) kWp</b></div>" }
+            if ($mo.Liefer -gt 0) { $tip += "<div class='tz'><i style='background:#adb5bd'></i>nur Liefertermin <b>$(& $kw $mo.Liefer) kWp</b></div>" }
+            $tip += (@($mo.Au | Sort-Object { $_.Datum } | Select-Object -First 10 | ForEach-Object { "<div class='td'><span>$($_.Datum.ToString('dd.MM.')) $(HtmlEncode $_.Au.Kunde)$(if ($_.Typ -eq 'Liefer') { ' <i class=''leise''>(Liefertermin)</i>' })</span><span>$(& $kw $_.Au.kWp)</span></div>" })) -join ''
+            if ($mo.Au.Count -gt 10) { $tip += "<div class='td leise'>&hellip; $($mo.Au.Count - 10) weitere</div>" }
+        }
+        $istHeute = ($key -eq $heute.ToString('yyyy-MM'))
+        [void]$mJson.Add("{""k"":$(& $js $de.DateTimeFormat.GetAbbreviatedMonthName($mo.Start.Month).Substring(0, 1)),""j"":$($mo.Start.Year),""m"":$($mo.Start.Month),""t"":[$(& $num $mo.Montiert),$(& $num $mo.Termin),$(& $num $mo.Liefer)],""vj"":$(if ($null -ne $vj) { & $num $vj } else { 'null' }),""h"":$(if ($istHeute) { 'true' } else { 'false' }),""tip"":$(& $js $tip)}")
+    }
+
+    # --- naechste 12 Wochen nach Montagetermin
+    $montag = $heute.AddDays(-(([int]$heute.DayOfWeek + 6) % 7))
+    $kal = $inv.Calendar; $termine = @(Get-Kalender)
+    $wJson = for ($i = 0; $i -lt 12; $i++) {
+        $ws = $montag.AddDays(7 * $i); $we = $ws.AddDays(6)
+        $au = @($offen | Where-Object { $_.Naechster -and $_.Naechster.T.Start.Date -ge $ws -and $_.Naechster.T.Start.Date -le $we } | Sort-Object { $_.Naechster.T.Start })
+        $ok = 0.0; $fe = 0.0
+        $zeilen = foreach ($a in $au) {
+            $f = @($a.Material | Where-Object { $_.Status -eq 'fehlt' })
+            if ($f.Count) { $fe += $a.kWp } else { $ok += $a.kWp }
+            "<div class='td'><span>$($a.Naechster.T.Start.ToString('ddd dd.MM.', $de)) $(HtmlEncode $a.Kunde) $(($a.Naechster.T.Team | ForEach-Object { "<span class='team'>$(HtmlEncode $_)</span>" }) -join '')$(if ($f.Count) { " <span class='chip fehlt'>Material fehlt</span>" })</span><span>$(& $kw $a.kWp)</span></div>"
+        }
+        $nKal = @($termine | Where-Object { $_.Start.Date -le $we -and $_.Ende.Date -ge $ws }).Count
+        $kwNr = $kal.GetWeekOfYear($ws.AddDays(3), [Globalization.CalendarWeekRule]::FirstFourDayWeek, [DayOfWeek]::Monday)
+        $tip = "<b>KW $kwNr</b> <span class='leise'>$($ws.ToString('dd.MM.'))&ndash;$($we.ToString('dd.MM.'))</span><div class='tz'>$($au.Count) Anlagen &middot; <b>$(& $kw ($ok + $fe)) kWp</b> &middot; $nKal Kalendertermine</div>$($zeilen -join '')"
+        "{""k"":""KW $kwNr"",""t"":[$(& $num $ok),$(& $num $fe)],""h"":$(if ($i -eq 0) { 'true' } else { 'false' }),""tip"":$(& $js $tip)}"
+    }
+
+    # --- Jahresvergleich (kumuliert)
+    $kum = foreach ($y in @(($jahr - 2), ($jahr - 1), $jahr)) {
+        $w = @(); $s = 0.0
+        for ($mm = 1; $mm -le 12; $mm++) {
+            $key = (New-Object DateTime $y, $mm, 1).ToString('yyyy-MM')
+            if ($y -eq $jahr -and $mm -gt $heute.Month) { break }
+            if ($monate.Contains($key)) { $s += $monate[$key].Montiert }
+            $w += & $num $s
+        }
+        $farbe = switch ($y - $jahr) { 0 { '#FFBC00' } -1 { '#343A40' } default { '#adb5bd' } }
+        "{""n"":""$y"",""f"":""$farbe"",""w"":[$($w -join ',')]}"
+    }
+    $daten = "{""m"":[$($mJson -join ',')],""w"":[$($wJson -join ',')],""kum"":[$($kum -join ',')]}"
+
+    # --- Kacheln
+    $diff = if ($vjYtd.kWp -gt 0) { [math]::Round(($ytd.kWp - $vjYtd.kWp) / $vjYtd.kWp * 100) } else { $null }
+    $kachel = { param($label, $wert, $sub, $link, $title) "<a class='dk'$(if ($link) { " href='$link'" })$(if ($title) { " title='$title'" })><div class='dk-l'>$label</div><div class='dk-w'>$wert</div><div class='dk-s'>$sub</div></a>" }
+    $kacheln = (& $kachel "Montiert $jahr" "$(& $kw $ytd.kWp) <small>kWp</small>" "$($ytd.Anlagen) Anlagen$(if ($null -ne $diff) { " &middot; <b class='$(if ($diff -ge 0) { 'plus' } else { 'minus' })'>$(if ($diff -ge 0) { '&#9650; +' } else { '&#9660; &minus;' })$([math]::Abs($diff)) %</b> zum Vorjahr" })" '' "Vorjahr bis $($vjTag.ToString('dd.MM.yyyy')): $(& $kw $vjYtd.kWp) kWp, $($vjYtd.Anlagen) Anlagen") +
+               (& $kachel 'Letzte 12 Monate' "$(& $kw $l12.kWp) <small>kWp</small>" "$($l12.Anlagen) Anlagen &middot; &Oslash; $(if ($l12.Anlagen) { & $kw ($l12.kWp / $l12.Anlagen) } else { '&ndash;' }) kWp" '' '') +
+               (& $kachel 'N&auml;chste 4 Wochen' "$(& $kw (& $sumKwp $in4)) <small>kWp</small>" "$($in4.Count) Montagen$(if ($in4Fehlt.Count) { " &middot; <b class='minus'>$($in4Fehlt.Count) mit fehlendem Material</b>" })" '/material?nur=fehlt&amp;tage=28' 'Auftr&auml;ge mit Montagetermin in den n&auml;chsten 4 Wochen') +
+               (& $kachel 'Offene Auftr&auml;ge' "$(& $kw (& $sumKwp $offen)) <small>kWp</small>" "$($offen.Count) Anlagen &middot; $($mitTermin.Count) mit Montagetermin" '/' 'Offene Modulmenge der Auftr&auml;ge mit Montage') +
+               (& $kachel 'Offene Angebote' "$(& $kw $angKwp) <small>kWp</small>" "$($ang.Count) Angebote der letzten 3 Monate" '/angebote' 'Angebote ohne sp&auml;teren Auftrag')
+    $hinweise = @()
+    if ($ueberf.Count) { $hinweise += "<a href='/'>$($ueberf.Count) Auftr&auml;ge ($(& $kw (& $sumKwp $ueberf)) kWp)</a> ohne Montagetermin mit &uuml;berschrittenem Liefertermin" }
+    if ($ohneTermin.Count) { $hinweise += "$($ohneTermin.Count) Auftr&auml;ge ($(& $kw (& $sumKwp $ohneTermin)) kWp) ganz ohne Termin" }
+    if ([math]::Abs($ohneWp) -gt 0) { $hinweise += "$(FmtZahl $ohneWp) gelieferte Module ohne erkennbare Leistung in der Bezeichnung (nicht mitgez&auml;hlt)" }
+
+    # --- Craftnote-Pipeline
+    $cnHtml = ""
+    try {
+        $cn = Get-Craftnote
+        if ($cn) {
+            $rang = @{ 'vertrieb' = 0; 'foerderung' = 1; 'auftrag' = 2; 'inbetrieb' = 3; 'service' = 4; 'fertig' = 5; 'absage' = 6; '' = 7 }
+            $reihe = @($cn.Status.Values); $grp = @($cn.Projekte | Where-Object { -not $_.Archiviert } | Group-Object Status)
+            $grp = @($grp | Sort-Object { $rang[(CN-Gruppe $_.Name)] }, { [array]::IndexOf($reihe, $_.Name) })
+            $max = ($grp | Measure-Object Count -Maximum).Maximum
+            $cnHtml = (@($grp | ForEach-Object {
+                $g = CN-Gruppe $_.Name; $leise = @('fertig', 'absage') -contains $g
+                "<div class='pz$(if ($leise) { ' pleise' })'><span class='pn'>$(HtmlEncode $(if ($_.Name) { $_.Name } else { 'ohne Status' }))</span><span class='pb'><span class='cnb cn-$g' style='width:$([math]::Max(1, 100 * $_.Count / $max).ToString('0.#', $inv))%'></span></span><span class='pc'>$($_.Count)</span></div>"
+            })) -join ''
+        } elseif ($script:CnFehler) { $cnHtml = "<p class='leise'>$($script:CnFehler)</p>" }
+    } catch { $cnHtml = "<p class='leise'>Craftnote nicht verf&uuml;gbar: $(HtmlEncode $_.Exception.Message)</p>" }
+
+    return @"
+$head
+$DashCss
+<div class='kopf'><h1>Dashboard</h1><div class='meta'>$(StandText)</div></div>
+<div class='dkacheln'>$kacheln</div>
+$(if ($hinweise.Count) { "<div class='hinweisbox'>$($hinweise -join ' &middot; ')</div>" })
+<div class='dkarte'>
+  <div class='dkopf'><h2>Montierte und geplante Leistung je Monat</h2>
+    <span class='dleg'><i style='background:#FFBC00'></i>montiert <i style='background:#343A40'></i>geplant mit Montagetermin <i style='background:#adb5bd'></i>nur Liefertermin <i class='vjl'></i>Vorjahresmonat</span></div>
+  <div id='dmon' class='dchart' style='height:320px'></div>
+</div>
+<div class='dzwei'>
+  <div class='dkarte'>
+    <div class='dkopf'><h2>N&auml;chste 12 Wochen nach Montagetermin</h2><span class='dleg'><i style='background:#1baf7a'></i>Material komplett <i style='background:#e5534b'></i>Material fehlt</span></div>
+    <div id='dwo' class='dchart' style='height:260px'></div>
+  </div>
+  <div class='dkarte'>
+    <div class='dkopf'><h2>Jahresvergleich kumuliert</h2><span class='dleg' id='dkumleg'></span></div>
+    <div id='dkum' class='dchart' style='height:260px'></div>
+  </div>
+</div>
+$(if ($cnHtml) { "<div class='dkarte'><div class='dkopf'><h2>Craftnote-Projekte nach Status</h2><span class='dleg'><a class='artlink' href='/abgleich'>Abgleich mit Sage &rarr;</a></span></div><div class='pipe'>$cnHtml</div></div>" })
+<div id='dtip' class='dtip'></div>
+<script>
+var DASH = $daten;
+$DashJs
+</script>
+</body></html>
+"@
+}
+
+$DashCss = @'
+<style>
+.dkacheln { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:12px; margin:0 0 16px; }
+a.dk { display:block; background:#fff; border-radius:10px; box-shadow:0 1px 3px rgba(0,0,0,.08); padding:12px 16px; text-decoration:none; color:#343A40; border-top:4px solid #FFBC00; }
+a.dk[href]:hover { box-shadow:0 2px 8px rgba(0,0,0,.15); }
+.dk-l { font-size:13px; color:#5B5B5A; font-weight:600; text-transform:uppercase; letter-spacing:.4px; }
+.dk-w { font-size:30px; font-weight:700; line-height:1.15; margin:4px 0 2px; font-variant-numeric:tabular-nums; }
+.dk-w small { font-size:15px; font-weight:500; color:#5B5B5A; }
+.dk-s { font-size:13px; color:#5B5B5A; }
+.plus { color:#1b5e20; } .minus { color:#c0392b; }
+.dkarte { background:#fff; border-radius:10px; box-shadow:0 1px 3px rgba(0,0,0,.08); padding:14px 16px 8px; margin:0 0 16px; }
+.dkopf { display:flex; flex-wrap:wrap; align-items:baseline; gap:6px 18px; }
+.dkopf h2 { margin:0 0 6px; font-size:17px; }
+.dleg { font-size:12px; color:#5B5B5A; display:inline-flex; flex-wrap:wrap; align-items:center; gap:4px 6px; }
+.dleg i { display:inline-block; width:11px; height:11px; border-radius:2px; margin-left:8px; }
+.dleg i.vjl { width:14px; height:0; border-top:2px dashed #898781; border-radius:0; }
+.dzwei { display:grid; grid-template-columns:repeat(auto-fit, minmax(460px, 1fr)); gap:16px; }
+.dchart { position:relative; }
+.dchart svg { display:block; overflow:visible; }
+.dchart text { font-family:inherit; font-size:11px; fill:#898781; font-variant-numeric:tabular-nums; }
+.dchart text.lbl { fill:#52514e; font-size:12px; }
+.dtip { display:none; position:fixed; z-index:50; pointer-events:none; background:#fff; border:1px solid rgba(11,11,11,.12); border-radius:8px;
+        box-shadow:0 4px 14px rgba(0,0,0,.14); padding:8px 11px; font-size:13px; color:#343A40; min-width:240px; max-width:440px; }
+.dtip .tz { margin-top:5px; display:flex; align-items:center; gap:6px; }
+.dtip .tz i { display:inline-block; width:10px; height:10px; border-radius:2px; }
+.dtip .td { display:flex; justify-content:space-between; gap:14px; font-size:12px; color:#52514e; padding-left:16px; margin-top:1px; }
+.dtip .td span:last-child { font-variant-numeric:tabular-nums; color:#343A40; white-space:nowrap; }
+.pipe { padding:4px 0 8px; }
+.pz { display:grid; grid-template-columns:minmax(220px, 300px) 1fr 50px; gap:10px; align-items:center; font-size:13px; padding:3px 0; }
+.pz.pleise { color:#9aa0a6; }
+.pb { height:12px; background:#f0efec; border-radius:6px; overflow:hidden; }
+.cnb { display:block; height:100%; border-radius:6px; background:#adb5bd; }
+.cnb.cn-vertrieb { background:#adb5bd; } .cnb.cn-foerderung { background:#eda100; } .cnb.cn-auftrag { background:#086ED5; }
+.cnb.cn-inbetrieb, .cnb.cn-fertig { background:#1baf7a; } .cnb.cn-absage { background:#e5534b; } .cnb.cn-service { background:#8e44ad; }
+.pz.pleise .cnb { opacity:.45; }
+.pc { text-align:right; font-variant-numeric:tabular-nums; font-weight:600; }
+</style>
+'@
+
+$DashJs = @'
+(function () {
+  var tip = document.getElementById('dtip');
+  function fmt(v) { return v.toLocaleString('de-DE', { maximumFractionDigits: 0 }); }
+  function niceStep(range, k) { if (range <= 0) return 1; var raw = range / k, mag = Math.pow(10, Math.floor(Math.log(raw) / Math.LN10)), r = raw / mag; return (r <= 1 ? 1 : r <= 2 ? 2 : r <= 2.5 ? 2.5 : r <= 5 ? 5 : 10) * mag; }
+  function zeigeTip(html, e) {
+    tip.innerHTML = html; tip.style.display = 'block';
+    var w = tip.offsetWidth, h = tip.offsetHeight, x = e.clientX + 16, y = e.clientY + 12;
+    if (x + w > window.innerWidth - 8) x = e.clientX - w - 16;
+    if (y + h > window.innerHeight - 8) y = Math.max(8, window.innerHeight - h - 8);
+    tip.style.left = Math.max(8, x) + 'px'; tip.style.top = y + 'px';
+  }
+  function versteckeTip() { tip.style.display = 'none'; }
+  // gestapelte Balken: daten = [{k, t:[...], vj?, h?, j?, m?, tip}], farben = [...]
+  function balken(id, daten, farben, opt) {
+    var el = document.getElementById(id); if (!el || !daten.length) return;
+    function zeichne() {
+      var W = el.clientWidth, H = el.clientHeight, m = { l: 52, r: 8, t: 14, b: opt.jahre ? 36 : 22 };
+      var iw = Math.max(W - m.l - m.r, 100), ih = H - m.t - m.b, n = daten.length, bw = iw / n;
+      var hi = 0; daten.forEach(function (d) { var s = 0; d.t.forEach(function (v) { s += Math.max(0, v); }); hi = Math.max(hi, s, d.vj || 0); });
+      var st = niceStep(hi * 1.08, 4), top = Math.ceil(hi * 1.08 / st) * st || 1;
+      function y(v) { return m.t + (top - v) / top * ih; }
+      var s = ['<svg width="' + W + '" height="' + H + '">'];
+      for (var v = 0; v <= top + st / 2; v += st) {
+        s.push('<line x1="' + m.l + '" x2="' + (m.l + iw) + '" y1="' + y(v) + '" y2="' + y(v) + '" stroke="' + (v === 0 ? '#c3c2b7' : '#e1e0d9') + '"/>');
+        s.push('<text x="' + (m.l - 8) + '" y="' + (y(v) + 4) + '" text-anchor="end">' + fmt(v) + '</text>');
+      }
+      var bb = Math.max(3, Math.min(34, bw * 0.72));
+      daten.forEach(function (d, i) {
+        var x0 = m.l + bw * i + (bw - bb) / 2, basis = 0;
+        if (d.h) s.push('<rect x="' + (m.l + bw * i) + '" y="' + m.t + '" width="' + bw + '" height="' + ih + '" fill="rgba(255,188,0,.10)"/>');
+        d.t.forEach(function (v, j) {
+          if (v <= 0) return;
+          var y1 = y(basis + v), y0 = y(basis), r = j === d.t.length - 1 || !d.t.slice(j + 1).some(function (x) { return x > 0; }) ? Math.min(3, (y0 - y1)) : 0;
+          s.push('<path d="M' + x0 + ',' + y0 + 'V' + (y1 + r) + 'Q' + x0 + ',' + y1 + ' ' + (x0 + r) + ',' + y1 + 'H' + (x0 + bb - r) + 'Q' + (x0 + bb) + ',' + y1 + ' ' + (x0 + bb) + ',' + (y1 + r) + 'V' + y0 + 'Z" fill="' + farben[j] + '"/>');
+          basis += v;
+        });
+        if (d.vj !== null && d.vj !== undefined) s.push('<line x1="' + (x0 - 2) + '" x2="' + (x0 + bb + 2) + '" y1="' + y(d.vj) + '" y2="' + y(d.vj) + '" stroke="#898781" stroke-width="2" stroke-dasharray="3,2"/>');
+        var jede = bw < 26 ? 2 : 1;
+        if (!opt.jahre || i % jede === 0 || d.m === 1) s.push('<text x="' + (m.l + bw * (i + 0.5)) + '" y="' + (H - m.b + 14) + '" text-anchor="middle"' + (d.h ? ' class="lbl" font-weight="700"' : '') + '>' + d.k + '</text>');
+        if (opt.jahre && (i === 0 || d.m === 1)) s.push('<text class="lbl" x="' + (m.l + bw * i + 2) + '" y="' + (H - m.b + 30) + '">' + d.j + '</text>');
+      });
+      daten.forEach(function (d, i) { s.push('<rect class="hit" data-i="' + i + '" x="' + (m.l + bw * i) + '" y="0" width="' + bw + '" height="' + H + '" fill="transparent"/>'); });
+      s.push('</svg>');
+      el.innerHTML = s.join('');
+      Array.prototype.forEach.call(el.querySelectorAll('rect.hit'), function (r) {
+        r.addEventListener('mousemove', function (e) { zeigeTip(daten[+r.getAttribute('data-i')].tip, e); });
+        r.addEventListener('mouseleave', versteckeTip);
+      });
+    }
+    zeichne(); var t; window.addEventListener('resize', function () { clearTimeout(t); t = setTimeout(zeichne, 150); });
+  }
+  // kumulierte Linien je Jahr
+  function linien(id, serien) {
+    var el = document.getElementById(id); if (!el || !serien.length) return;
+    var MON = ['Jan', 'Feb', 'M\u00e4r', 'Apr', 'Mai', 'Jun', 'Jul', 'Aug', 'Sep', 'Okt', 'Nov', 'Dez'];
+    document.getElementById('dkumleg').innerHTML = serien.map(function (s) { return '<i style="background:' + s.f + '"></i>' + s.n; }).join(' ');
+    function zeichne() {
+      var W = el.clientWidth, H = el.clientHeight, m = { l: 52, r: 54, t: 14, b: 22 }, iw = Math.max(W - m.l - m.r, 100), ih = H - m.t - m.b;
+      var hi = 0; serien.forEach(function (s) { s.w.forEach(function (v) { hi = Math.max(hi, v); }); });
+      var st = niceStep(hi * 1.08, 4), top = Math.ceil(hi * 1.08 / st) * st || 1;
+      function x(i) { return m.l + iw * (i + 0.5) / 12; } function y(v) { return m.t + (top - v) / top * ih; }
+      var s = ['<svg width="' + W + '" height="' + H + '">'];
+      for (var v = 0; v <= top + st / 2; v += st) {
+        s.push('<line x1="' + m.l + '" x2="' + (m.l + iw) + '" y1="' + y(v) + '" y2="' + y(v) + '" stroke="' + (v === 0 ? '#c3c2b7' : '#e1e0d9') + '"/>');
+        s.push('<text x="' + (m.l - 8) + '" y="' + (y(v) + 4) + '" text-anchor="end">' + fmt(v) + '</text>');
+      }
+      for (var i = 0; i < 12; i++) s.push('<text x="' + x(i) + '" y="' + (H - m.b + 14) + '" text-anchor="middle">' + MON[i].charAt(0) + '</text>');
+      serien.forEach(function (se, k) {
+        if (!se.w.length) return;
+        var p = se.w.map(function (v, i) { return (i ? 'L' : 'M') + x(i) + ',' + y(v); }).join('');
+        s.push('<path d="' + p + '" fill="none" stroke="' + se.f + '" stroke-width="' + (k === serien.length - 1 ? 3 : 2) + '" stroke-linejoin="round" stroke-linecap="round"/>');
+        var l = se.w.length - 1; s.push('<circle cx="' + x(l) + '" cy="' + y(se.w[l]) + '" r="4" fill="' + se.f + '" stroke="#fff" stroke-width="2"/>');
+        s.push('<text class="lbl" x="' + (x(l) + 8) + '" y="' + (y(se.w[l]) + 4) + '">' + fmt(se.w[l]) + '</text>');
+      });
+      s.push('<line id="kumx" x1="0" x2="0" y1="' + m.t + '" y2="' + (H - m.b) + '" stroke="#898781" visibility="hidden"/>');
+      s.push('<rect id="kumhit" x="' + m.l + '" y="0" width="' + iw + '" height="' + H + '" fill="transparent"/></svg>');
+      el.innerHTML = s.join('');
+      var hit = document.getElementById('kumhit'), lx = document.getElementById('kumx');
+      hit.addEventListener('mousemove', function (e) {
+        var r = el.getBoundingClientRect(), i = Math.max(0, Math.min(11, Math.floor((e.clientX - r.left - m.l) / (iw / 12))));
+        lx.setAttribute('x1', x(i)); lx.setAttribute('x2', x(i)); lx.setAttribute('visibility', 'visible');
+        var h = '<b>bis Ende ' + MON[i] + '</b>';
+        serien.slice().reverse().forEach(function (se) { if (se.w.length > i) h += '<div class="tz"><i style="background:' + se.f + '"></i>' + se.n + ' <b style="margin-left:auto">' + fmt(se.w[i]) + ' kWp</b></div>'; });
+        zeigeTip(h, e);
+      });
+      hit.addEventListener('mouseleave', function () { lx.setAttribute('visibility', 'hidden'); versteckeTip(); });
+    }
+    zeichne(); var t; window.addEventListener('resize', function () { clearTimeout(t); t = setTimeout(zeichne, 150); });
+  }
+  balken('dmon', DASH.m, ['#FFBC00', '#343A40', '#adb5bd'], { jahre: true });
+  balken('dwo', DASH.w, ['#1baf7a', '#e5534b'], {});
+  linien('dkum', DASH.kum);
+})();
+'@
 
 # ---------- Dienst ----------
 if ($MyInvocation.InvocationName -eq '.') { return }   # dot-gesourct (Test): nur Funktionen laden
@@ -3797,6 +4163,8 @@ ORDER BY Lagerkennung, ISNULL(Dimension1, 0), ISNULL(Dimension2, 0), ISNULL(Dime
                 $null = Get-Auftraege
                 $ausgabe = Build-EkDetail (Run-Query $SQL_EkBeleg @{ "@bel" = [int]$bel }) $script:EkPositionen $null
             } catch { $ausgabe = Build-EkDetail $null @() ($_.Exception.ToString()) }
+        } elseif ($pfad -eq "/dashboard") {
+            try { $ausgabe = Build-Dashboard $null } catch { $ausgabe = Build-Dashboard ($_.Exception.ToString()) }
         } elseif ($pfad -eq "/abgleich") {
             try { $liste = @(Get-Auftraege); $cn = Craftnote-Zuordnen $liste; $ausgabe = Build-Abgleich $liste $cn $null }
             catch { $ausgabe = Build-Abgleich @() $null ($_.Exception.ToString()) }
