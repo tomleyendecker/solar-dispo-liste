@@ -313,39 +313,52 @@ function Page-Head($titel) {
 <meta charset='utf-8'>
 <meta name='viewport' content='width=device-width, initial-scale=1'>
 <title>$titel</title>
+<link rel='icon' href='/static/logo.svg'>
 <style>
+/* Farben und Schrift wie leyendecker.solar: Gelb #FFBC00, Anthrazit #343A40, Hellgrau #F8F9FA, Barlow */
+@font-face { font-family:'Barlow'; font-weight:400; font-display:swap; src:url('/static/barlow-regular.woff2') format('woff2'); }
+@font-face { font-family:'Barlow'; font-weight:500; font-display:swap; src:url('/static/barlow-500.woff2') format('woff2'); }
+@font-face { font-family:'Barlow'; font-weight:600; font-display:swap; src:url('/static/barlow-600.woff2') format('woff2'); }
+@font-face { font-family:'Barlow'; font-weight:700; font-display:swap; src:url('/static/barlow-700.woff2') format('woff2'); }
 * { box-sizing: border-box; }
-body { font-family: Segoe UI, Roboto, Arial, sans-serif; margin:0; padding:24px; background:#f4f5f7; color:#1a1a1a; }
+body { font-family: Barlow, Segoe UI, Arial, sans-serif; font-size:15px; margin:0; padding:24px; background:#F8F9FA; color:#343A40; }
 .kopf { display:flex; align-items:baseline; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:16px; }
-h1 { font-size:20px; margin:0; }
-h2 { font-size:16px; margin:20px 0 10px; }
-.meta { font-size:13px; color:#666; }
-.steuer { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:12px; align-items:center; }
-.suche, .btn { padding:8px 12px; border:1px solid #ccc; border-radius:6px; font-size:14px; }
-.suche { width:100%; max-width:420px; }
-.btn { background:#2c3e50; color:#fff; text-decoration:none; border:none; cursor:pointer; display:inline-block; }
-.btn2 { background:#fff; color:#2c3e50; border:1px solid #c5ccd4; }
-table { border-collapse:collapse; width:100%; background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.1); border-radius:8px; overflow:hidden; font-size:13px; }
-th, td { padding:7px 10px; text-align:left; border-bottom:1px solid #eee; vertical-align:top; }
-th { background:#2c3e50; color:#fff; position:sticky; top:0; white-space:nowrap; }
-tr:hover td { background:#f0f7ff; }
+h1 { font-size:26px; font-weight:700; margin:0; text-transform:uppercase; letter-spacing:.3px; color:#343A40; }
+h2 { font-size:18px; font-weight:700; margin:22px 0 10px; }
+.meta { font-size:14px; color:#5B5B5A; }
+.steuer { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; align-items:center; }
+.suche, .btn { padding:8px 16px; border:1px solid #d6d8db; border-radius:999px; font-family:inherit; font-size:14px; }
+.suche { width:100%; max-width:420px; background:#fff; color:#343A40; }
+.suche:focus { outline:none; border-color:#FFBC00; box-shadow:0 0 0 3px rgba(255,188,0,.25); }
+.btn { background:#343A40; color:#fff; font-weight:600; text-decoration:none; border:1px solid #343A40; cursor:pointer; display:inline-block; }
+.btn:hover { background:#23272b; }
+.btn2 { background:#fff; color:#343A40; border:1px solid #c9ccd0; font-weight:500; }
+.btn2:hover { background:#fff; border-color:#FFBC00; }
+table { border-collapse:collapse; width:100%; background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.08); border-radius:10px; overflow:hidden; font-size:14px; }
+th, td { padding:8px 11px; text-align:left; border-bottom:1px solid #eceef0; vertical-align:top; }
+th { background:#343A40; color:#fff; font-weight:600; position:sticky; top:0; white-space:nowrap; }
+tr:hover td { background:#fff8e0; }
 .num { text-align:right; font-variant-numeric:tabular-nums; }
 .warn { color:#c0392b; font-weight:600; }
-.leise { color:#888; font-size:12px; }
-.fehler { background:#fdecea; color:#b71c1c; padding:12px 16px; border-radius:8px; margin-bottom:12px; }
-.hinweisbox { background:#fff8e1; border:1px solid #ffe082; padding:8px 12px; border-radius:6px; font-size:13px; margin-bottom:12px; }
-a.artlink { color:#1565c0; text-decoration:none; font-weight:600; }
+.leise { color:#868e96; font-size:13px; }
+.fehler { background:#fdecea; color:#b71c1c; padding:12px 16px; border-radius:10px; margin-bottom:12px; }
+.hinweisbox { background:#fff8e0; border:1px solid #ffe08a; padding:8px 12px; border-radius:10px; font-size:14px; margin-bottom:12px; }
+a.artlink { color:#086ED5; text-decoration:none; font-weight:600; }
 a.artlink:hover { text-decoration:underline; }
-.hauptnav { display:flex; flex-wrap:wrap; align-items:center; gap:4px 22px; margin:-24px -24px 20px; padding:8px 24px; background:#2c3e50; box-shadow:0 1px 3px rgba(0,0,0,.15); }
-.hauptnav .marke { color:#fff; font-weight:700; font-size:16px; text-decoration:none; margin-right:6px; }
-.hauptnav a.nav { color:#dfe6ed; text-decoration:none; font-size:13px; padding:5px 9px; border-radius:5px; white-space:nowrap; }
-.hauptnav a.nav:hover { background:#34495e; color:#fff; }
-.hauptnav a.nav.aktiv { background:#fff; color:#2c3e50; font-weight:600; }
-.art { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px; font-weight:700; background:#e8f4fd; color:#1565c0; white-space:nowrap; }
-.art.res { background:#fff3e0; color:#e65100; }
-.team { display:inline-block; padding:0 6px; border-radius:8px; background:#2c3e50; color:#fff; font-size:10px; font-weight:700; line-height:16px; margin:1px 2px 1px 0; white-space:nowrap; }
+/* Kopf: weiss mit Logo, darunter die gelbe Doppellinie der Webseite */
+.hauptnav { display:flex; flex-wrap:wrap; align-items:center; gap:4px 26px; margin:-24px -24px 26px; padding:10px 24px; background:#fff;
+            border-bottom:1px solid #FFBC00; box-shadow:0 3px 0 #fff, 0 4px 0 #FFBC00; }
+.hauptnav .marke { display:flex; align-items:center; gap:12px; text-decoration:none; margin-right:10px; }
+.hauptnav .marke img { height:42px; display:block; }
+.hauptnav .marke span { font-size:13px; font-weight:600; letter-spacing:2px; text-transform:uppercase; color:#5B5B5A; border-left:1px solid #d6d8db; padding-left:12px; }
+.hauptnav a.nav { color:#343A40; text-decoration:none; font-size:15px; font-weight:600; padding:6px 2px; border-bottom:3px solid transparent; white-space:nowrap; }
+.hauptnav a.nav:hover { border-bottom-color:#ffe08a; }
+.hauptnav a.nav.aktiv { border-bottom-color:#FFBC00; }
+.art { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; font-weight:700; background:#e7f1fc; color:#086ED5; white-space:nowrap; }
+.art.res { background:#fff3d6; color:#b26a00; }
+.team { display:inline-block; padding:0 7px; border-radius:8px; background:#343A40; color:#fff; font-size:11px; font-weight:600; line-height:17px; margin:1px 2px 1px 0; white-space:nowrap; }
 .unsicher { color:#e65100; font-weight:700; cursor:help; }
-.chip { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; font-weight:600; margin:1px 3px 1px 0; white-space:nowrap; }
+.chip { display:inline-block; padding:1px 9px; border-radius:10px; font-size:12px; font-weight:600; margin:1px 3px 1px 0; white-space:nowrap; }
 .chip.da { background:#d6f0dc; color:#1b5e20; }
 .chip.bestellt { background:#e3f2fd; color:#0d47a1; }
 .chip.fehlt { background:#fdecea; color:#b71c1c; }
@@ -353,7 +366,7 @@ a.artlink:hover { text-decoration:underline; }
 </style>
 </head>
 <body>
-<nav class='hauptnav'><a class='marke' href='/'>Solar Dispo</a>
+<nav class='hauptnav'><a class='marke' href='/'><img src='/static/logo.svg' alt='Leyendecker Solar'><span>Dispo</span></a>
   <a class='nav$(if ($pfad -eq '/' -or $pfad -eq '/auftrag') { ' aktiv' })' href='/'>Offene Auftr&auml;ge</a>
   <a class='nav$(if ($pfad -eq '/material') { ' aktiv' })' href='/material'>Materialbedarf</a>
   <a class='nav$(if ($pfad -eq '/angebote') { ' aktiv' })' href='/angebote'>Angebote</a>
@@ -1060,8 +1073,8 @@ $VerbrauchChartJs = @'
   // gewichteter gleitender Durchschnitt (WMA) ueber 6 Monate
   var GEW = 6, wma = M.map(function (x, i) {
     var sw = 0, sg = 0;
-    for (var j = 0; j < GEW && i - j >= 0; j++) { sw += M[i - j].w * (GEW - j); sg += GEW - j; }
-    return sw / sg;
+    for (var j = 0; j < GEW && i - j >= (VERB.ab || 0); j++) { sw += M[i - j].w * (GEW - j); sg += GEW - j; }
+    return sg ? sw / sg : 0;
   });
   // Ausreisser kappen: Achse hoechstens bis zum 3-fachen Median bzw. knapp ueber den viertgroessten Monat
   var werte = M.map(function (x) { return x.w; }).sort(function (a, b) { return b - a; });
@@ -1153,44 +1166,50 @@ function Build-Verbrauch($artikel, $bestandHeute) {
     }
     $summe = { param($a, $b) $x = 0.0; for ($i = $a; $i -lt $b; $i++) { $x += $mon[$i].EA + $mon[$i].EF + $mon[$i].EM - $mon[$i].ZS }; [math]::Max(0, $x) }
     $tage = { param($a, $b) ($von.AddMonths($b) - $von.AddMonths($a)).TotalDays }
-    $proWo = { param($a, $b) (& $summe $a $b) / ((& $tage $a $b) / 7) }
     $n = $VerbrauchMonate
+    # Durchschnitte erst ab dem ersten Monat mit Verbrauch (neue Artikel), $null = Zeitraum liegt ganz davor
+    $i0 = 0; while ($i0 -lt $n - 1 -and ($mon[$i0].EA + $mon[$i0].EF + $mon[$i0].EM) -le 0) { $i0++ }
+    $proWo = { param($a, $b) $a = [math]::Max($a, $i0); if ($a -ge $b) { return $null }; (& $summe $a $b) / ((& $tage $a $b) / 7) }
     $w3 = & $proWo ($n - 3) $n; $w6 = & $proWo ($n - 6) $n; $w12 = & $proWo ($n - 12) $n; $wVj = & $proWo ($n - 24) ($n - 12)
-    # gewichteter Durchschnitt je Woche: letzte 6 Monate, juengster Monat Gewicht 6
+    $seit = $von.AddMonths($i0).ToString('MM/yyyy')
+    # gewichteter Durchschnitt je Woche: letzte 6 Monate (ab erstem Verbrauch), juengster Monat Gewicht 6
     $sw = 0.0; $sg = 0
-    for ($j = 0; $j -lt 6; $j++) { $sw += (& $proWo ($n - 1 - $j) ($n - $j)) * (6 - $j); $sg += 6 - $j }
-    $wGew = $sw / $sg
+    for ($j = 0; $j -lt 6 -and $n - 1 - $j -ge $i0; $j++) { $sw += (& $proWo ($n - 1 - $j) ($n - $j)) * (6 - $j); $sg += 6 - $j }
+    $wGew = if ($sg) { $sw / $sg } else { 0.0 }
 
     $b = ToNum $bestandHeute; if ($null -eq $b) { $b = 0 }
-    $zahl = { param($x) ([math]::Round($x)).ToString('N0', $de) }
-    $reichweite = { param($w) if ($w -le 0) { $null } elseif ($b -le 0) { 0 } else { $b / $w } }
+    $zahl = { param($x) if ($null -eq $x) { return "&ndash;" }; ([math]::Round($x)).ToString('N0', $de) }
+    $reichweite = { param($w) if ($null -eq $w -or $w -le 0) { $null } elseif ($b -le 0) { 0 } else { $b / $w } }
     $rwG = & $reichweite $wGew; $rw12 = & $reichweite $w12
     $rwTxt = if ($null -eq $rwG) { "&ndash;" } elseif ($rwG -ge 100) { "&gt; 100 Wochen" } else { "$($rwG.ToString('N1', $de)) Wochen" }
     $rwTitle = "Bestand $(& $zahl $b) / gewichteter &Oslash; $(& $zahl $wGew) je Woche" + $(if ($null -ne $rw12) { " &middot; bei &Oslash; 12 Monate: $($rw12.ToString('N1', $de)) Wochen" } else { "" })
     $trend = ""
-    if ($wVj -gt 0) {
+    if ($null -ne $wVj -and $null -ne $w12 -and $wVj -gt 0) {
         $p = [math]::Round(($w12 - $wVj) / $wVj * 100)
         $trend = "<div class='vk-s' title='&Oslash; 12 Monate gegen&uuml;ber den 12 Monaten davor'>$(if ($p -ge 0) { '&#9650; +' } else { '&#9660; &minus;' })$([math]::Abs($p)) %</div>"
     }
     $kachel = { param($label, $wert, $sub, $title) "<div class='vkachel'$(if ($title) { " title='$title'" })><div class='vk-l'>$label</div><div class='vk-w'>$wert</div>$sub</div>" }
-    $kacheln = (& $kachel '&Oslash; 3 Monate' "$(& $zahl $w3) <small>/Wo</small>" '' '') +
-               (& $kachel '&Oslash; 6 Monate' "$(& $zahl $w6) <small>/Wo</small>" '' '') +
-               (& $kachel '&Oslash; 12 Monate' "$(& $zahl $w12) <small>/Wo</small>" '' '') +
-               (& $kachel 'Vorjahr' "$(& $zahl $wVj) <small>/Wo</small>" $trend '&Oslash; der 12 Monate davor') +
+    # Zeitraum reicht vor den ersten Verbrauch: Hinweis "seit MM/yyyy"
+    $abSub = { param($monate) if ($n - $monate -lt $i0 -and $n - $i0 -lt $monate) { "<div class='vk-s'>seit $seit</div>" } else { '' } }
+    $kacheln = (& $kachel '&Oslash; 3 Monate' "$(& $zahl $w3) <small>/Wo</small>" (& $abSub 3) '') +
+               (& $kachel '&Oslash; 6 Monate' "$(& $zahl $w6) <small>/Wo</small>" (& $abSub 6) '') +
+               (& $kachel '&Oslash; 12 Monate' "$(& $zahl $w12) <small>/Wo</small>" (& $abSub 12) '') +
+               (& $kachel 'Vorjahr' $(if ($null -eq $wVj) { '&ndash;' } else { "$(& $zahl $wVj) <small>/Wo</small>" }) $trend $(if ($null -eq $wVj) { "Erster Verbrauch $seit" } else { '&Oslash; der 12 Monate davor' })) +
                (& $kachel 'Reichweite' $rwTxt "<div class='vk-s'>bei gewichtetem &Oslash; $(& $zahl $wGew) /Wo</div>" $rwTitle)
 
     # JSON fuer das Diagramm (Texte mit \u-Escapes)
     $js = { param($s) -join @(([string]$s).ToCharArray() | ForEach-Object { if ([int]$_ -lt 128 -and $_ -ne '"' -and $_ -ne '\' -and $_ -ne '<') { [string]$_ } else { '\u{0:x4}' -f [int]$_ } }) }
     $num = { param($x) ([double]$x).ToString($inv) }
     $texte = @{ EA = 'Lieferung an Kunde'; EF = 'Verbrauch Fertigung'; EM = 'Entnahme manuell'; ZS = 'Storno Lieferung' }
-    $mJson = for ($i = 0; $i -lt $n; $i++) {
+    $cs = [math]::Min($i0, $n - 12)
+    $mJson = for ($i = $cs; $i -lt $n; $i++) {
         $d0 = $von.AddMonths($i); $mm = $mon[$i]
         $s = [math]::Max(0, $mm.EA + $mm.EF + $mm.EM - $mm.ZS)
         $det = @(foreach ($k in 'EA', 'EF', 'EM', 'ZS') { if ($mm[$k] -ne 0) { "[""$($texte[$k])"",$(& $num $(if ($k -eq 'ZS') { -$mm[$k] } else { $mm[$k] }))]" } }) -join ','
         $l = $de.DateTimeFormat.GetMonthName($d0.Month) + " " + $d0.Year
         "{""l"":""$(& $js $l)"",""k"":""$(& $js $de.DateTimeFormat.GetMonthName($d0.Month).Substring(0,1))"",""j"":$($d0.Year),""w"":$(& $num ($s / ($d0.AddMonths(1) - $d0).TotalDays * 7)),""s"":$(& $num $s),""d"":[$det]}"
     }
-    $daten = "{""avg12"":$(& $num $w12),""m"":[$($mJson -join ',')]}"
+    $daten = "{""avg12"":$(& $num $(if ($null -eq $w12) { 0 } else { $w12 })),""ab"":$($i0 - $cs),""m"":[$($mJson -join ',')]}"
     return @"
 <div class='dokkarte hkarte' id='verbrauch'>
 $titel
@@ -1214,17 +1233,17 @@ $BewegungsArten = @{
 $DispoCss = @"
 <style>
 .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; }
-.badge-bestand { background:#e8f4fd; color:#1565c0; }
+.badge-bestand { background:#e8f4fd; color:#086ED5; }
 .badge-vk      { background:#fde8e8; color:#b71c1c; }
 .badge-mb      { background:#f3e5f5; color:#6a1b9a; }
 .badge-ek      { background:#fff3e0; color:#e65100; }
 .sign-plus     { color:#27ae60; font-weight:600; text-align:right; }
 .sign-minus    { color:#c0392b; font-weight:600; text-align:right; }
-.fazit         { padding:10px 14px; border-radius:6px; margin:0 0 12px; background:#eef3f8; font-size:14px; }
-.warn-box      { background:#fdecea; color:#b71c1c; }
-.ok-box        { background:#e8f5e9; color:#1b5e20; }
+.fazit         { padding:10px 14px; border-radius:10px; margin:0 0 12px; background:#fff; border-left:4px solid #FFBC00; box-shadow:0 1px 3px rgba(0,0,0,.08); font-size:15px; }
+.warn-box      { background:#fdecea; color:#b71c1c; border-left-color:#c0392b; }
+.ok-box        { background:#e8f5e9; color:#1b5e20; border-left-color:#27ae60; }
 .chartkarte    { background:#fcfcfb; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,.1); padding:14px 16px 8px; margin:0 0 16px; position:relative; }
-.charttitel    { font-size:14px; font-weight:600; color:#0b0b0b; }
+.charttitel    { font-size:16px; font-weight:700; color:#343A40; }
 .chartsub      { font-size:12px; color:#52514e; margin:2px 0 6px; }
 #chart         { position:relative; height:280px; }
 #chart svg     { display:block; overflow:visible; }
@@ -1235,10 +1254,10 @@ $DispoCss = @"
 .charttip .wert { font-size:15px; font-weight:700; color:#0b0b0b; }
 .charttip .zeile { display:flex; gap:8px; justify-content:space-between; margin-top:3px; }
 .charttip .zeile span:last-child { font-variant-numeric:tabular-nums; color:#0b0b0b; white-space:nowrap; }
-.dokkarte      { background:#fff; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,.1); padding:12px 14px; margin:20px 0 16px; }
-.dokkarte h3   { margin:0 0 8px; font-size:15px; }
+.dokkarte      { background:#fff; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,.1); padding:14px 16px; margin:20px 0 16px; }
+.dokkarte h3   { margin:0 0 8px; font-size:17px; font-weight:700; }
 .dokgruppe     { margin:10px 0 4px; }
-.dokgruppe h4  { margin:0 0 6px; font-size:13px; color:#2c3e50; }
+.dokgruppe h4  { margin:0 0 6px; font-size:13px; color:#343A40; }
 .dok           { font-size:13px; padding:4px 0; border-bottom:1px solid #f0f0f0; display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
 .dok.fehlt     { color:#999; }
 .dokext        { display:inline-block; min-width:34px; text-align:center; padding:1px 5px; border-radius:4px; font-size:10px; font-weight:700; background:#eceff1; color:#455a64; }
@@ -1249,7 +1268,7 @@ $DispoCss = @"
 .dokbild       { display:flex; flex-direction:column; width:170px; text-decoration:none; color:#333; font-size:11px; }
 .dokbild img   { width:170px; height:120px; object-fit:contain; background:#f4f5f7; border:1px solid #e1e4e8; border-radius:6px; }
 .dokbild span  { margin-top:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.dokbild:hover img { border-color:#1565c0; }
+.dokbild:hover img { border-color:#086ED5; }
 .doksprung     { font-size:12px; font-weight:400; margin-left:12px; }
 .hkarte       { position:relative; }
 .hlegende     { display:flex; flex-wrap:wrap; gap:6px 16px; align-items:center; font-size:12px; color:#52514e; margin:2px 0 6px; }
@@ -1278,7 +1297,7 @@ $DispoCss = @"
 .vw-wahl      { margin-left:auto; display:inline-flex; border:1px solid #d0d4d9; border-radius:6px; overflow:hidden; }
 .vw-wahl button { border:0; background:#fff; color:#52514e; font:inherit; font-size:12px; padding:3px 10px; cursor:pointer; }
 .vw-wahl button + button { border-left:1px solid #d0d4d9; }
-.vw-wahl button.an { background:#2c3e50; color:#fff; }
+.vw-wahl button.an { background:#343A40; color:#fff; }
 .vw-sum       { font-size:12px; color:#52514e; margin:2px 0 4px; }
 .vw-stapel    { display:flex; gap:2px; height:22px; border-radius:4px; overflow:hidden; margin-bottom:10px; }
 .vw-seg       { height:100%; display:flex; align-items:center; justify-content:center; color:#fff; font-size:11px; font-weight:700; min-width:3px; }
@@ -1303,7 +1322,7 @@ $DispoCss = @"
     border-radius:0 0 6px 6px; max-height:280px; overflow-y:auto; z-index:10; display:none; }
 .vorschlaege div { padding:8px 12px; cursor:pointer; font-size:13px; border-bottom:1px solid #f0f0f0; display:flex; gap:10px; line-height:1.35; }
 .vorschlaege div:hover, .vorschlaege div.sel { background:#f0f7ff; }
-.vorschlaege .nr { color:#1565c0; font-weight:600; flex-shrink:0; }
+.vorschlaege .nr { color:#086ED5; font-weight:600; flex-shrink:0; }
 /* Vorschlagsliste darf breiter als das Eingabefeld werden, lange Bezeichnungen brechen um */
 .vorschlaege { right:auto; min-width:100%; width:max-content; max-width:min(720px, calc(100vw - 48px)); max-height:360px;
     border-top:1px solid #ccc; border-radius:0 6px 6px 6px; box-shadow:0 4px 12px rgba(0,0,0,.12); }
@@ -1834,6 +1853,16 @@ while ($listener.IsListening) {
             $mn = Parse-Query $query "monate"; $monate = if (@('3', '6', '12') -contains $mn) { [int]$mn } else { 3 }
             try { $ausgabe = Build-Angebote $monate $null }
             catch { $ausgabe = Build-Angebote $monate ($_.Exception.ToString()) }
+        } elseif ($pfad -match '^/static/([a-z0-9_-]+\.(woff2|svg))$') {
+            $sDatei = Join-Path (Join-Path $PSScriptRoot 'static') $matches[1]
+            if (Test-Path -LiteralPath $sDatei -PathType Leaf) {
+                $bytes = [System.IO.File]::ReadAllBytes($sDatei)
+                $response.ContentType = if ($sDatei -like '*.svg') { 'image/svg+xml' } else { 'font/woff2' }
+                $response.AddHeader("Cache-Control", "public, max-age=86400")
+                $response.ContentLength64 = $bytes.Length
+                $response.OutputStream.Write($bytes, 0, $bytes.Length); $response.OutputStream.Close()
+                $bereitsGesendet = $true
+            } else { $response.StatusCode = 404; $ausgabe = "Nicht gefunden" }
         } elseif ($pfad -eq "/dispo") {
             $art = ([string](Parse-Query $query "art")).Trim() -replace "[';]", ""
             $ausgabe = Dispo-Seite $art
