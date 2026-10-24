@@ -173,7 +173,7 @@ OUTER APPLY (
 CROSS APPLY (SELECT vp.GGBestellt - ISNULL(res.Menge, 0) AS Menge) soll
 "@
 $SQL_OffeneAuftraege = @"
-SELECT k.BelID, k.VorID, k.Belegart, CAST(k.Belegjahr AS varchar) + '-' + CAST(k.Belegnummer AS varchar) AS Beleg, k.Belegdatum,
+SELECT k.BelID, k.VorID, k.A0Empfaenger, k.Belegart, CAST(k.Belegjahr AS varchar) + '-' + CAST(k.Belegnummer AS varchar) AS Beleg, k.Belegdatum,
        k.A0Name1, k.A0Name2, k.A0Strasse, k.A0PLZ, k.A0Ort, k.A1Name1, k.A1Strasse, k.A1PLZ, k.A1Ort,
        p.BelPosID, p.Position, p.Artikelnummer, p.Bezeichnung1 AS PosBezeichnung, p.Liefertermin,
        (soll.Menge - vp.GGGeliefert) AS Offen, a.Artikelgruppe, a.Lagerfuehrung, a.Stuecklistentyp, a.Bezeichnung1 AS ArtBezeichnung
@@ -265,7 +265,7 @@ function Get-Auftraege {
             $bsName = ([string]$r["A1Name1"]).Trim(); $bsStr = ([string]$r["A1Strasse"]).Trim(); $bsOrt = ("$($r['A1PLZ']) $($r['A1Ort'])").Trim()
             if (-not $bsStr -and -not $bsOrt) { $bsStr = ([string]$r["A0Strasse"]).Trim(); $bsOrt = ("$($r['A0PLZ']) $($r['A0Ort'])").Trim() }
             $kunde = (@(([string]$r["A0Name1"]).Trim(), ([string]$r["A0Name2"]).Trim()) | Where-Object { $_ }) -join ' '
-            $auftraege[$id] = @{ BelID = $id; VorID = [string]$r["VorID"]; Stand = $null; Folgebelege = @(); Beleg = [string]$r["Beleg"]; Art = $art; Datum = $r["Belegdatum"]; Kunde = $kunde; Name1 = [string]$r["A0Name1"]
+            $auftraege[$id] = @{ BelID = $id; VorID = [string]$r["VorID"]; Kto = [string]$r["A0Empfaenger"]; Plz = @(([string]$r["A1PLZ"]).Trim(), ([string]$r["A0PLZ"]).Trim()); StrasseRoh = $bsStr; Cn = $null; Stand = $null; Folgebelege = @(); Beleg = [string]$r["Beleg"]; Art = $art; Datum = $r["Belegdatum"]; Kunde = $kunde; Name1 = [string]$r["A0Name1"]
                                  Baustelle = (@($bsStr, $bsOrt) | Where-Object { $_ }) -join ', '; BaustelleName = $bsName
                                  Liefertermin = $null; kWp = 0.0; Material = (New-Object System.Collections.ArrayList); Leistungen = (New-Object System.Collections.ArrayList) }
         }
@@ -391,6 +391,14 @@ a.artlink:hover { text-decoration:underline; }
 .chip.fehlt { background:#fdecea; color:#b71c1c; }
 .chip.kein { background:#eceff1; color:#546e7a; }
 tr.erledigt td, tr.erledigt td a.artlink { color:#9aa0a6; }
+a.cn { display:inline-block; padding:1px 9px; border-radius:10px; font-size:12px; font-weight:600; text-decoration:none; white-space:nowrap; background:#eceff1; color:#455a64; }
+a.cn:hover { text-decoration:underline; }
+a.cn-auftrag { background:#e7f1fc; color:#086ED5; }
+a.cn-foerderung { background:#fff3d6; color:#b26a00; }
+a.cn-inbetrieb, a.cn-fertig { background:#d6f0dc; color:#1b5e20; }
+a.cn-absage { background:#fdecea; color:#b71c1c; }
+a.cn-service { background:#f3e5f5; color:#6a1b9a; }
+details summary { cursor:pointer; }
 </style>
 </head>
 <body>
@@ -401,6 +409,7 @@ tr.erledigt td, tr.erledigt td a.artlink { color:#9aa0a6; }
   <a class='nav$(if ($pfad -eq '/einkauf' -or $pfad -eq '/ek') { ' aktiv' })' href='/einkauf'>Einkauf</a>
   <a class='nav$(if ($pfad -eq '/dispo') { ' aktiv' })' href='/dispo'>Dispo</a>
   <a class='nav$(if ($pfad -eq '/bewegungen') { ' aktiv' })' href='/bewegungen'>Bewegungen</a>
+  <a class='nav$(if ($pfad -eq '/abgleich') { ' aktiv' })' href='/abgleich'>Abgleich</a>
 </nav>
 $(if (Test-ChatErlaubt) { $ChatWidgetHtml })
 "@
@@ -437,7 +446,7 @@ function Stand-Html($stand, $was) {
 }
 function Build-Auftraege($liste, $fehler) {
     $head = Page-Head "Solar Dispo - Offene Auftraege"
-    $hinweis = if ($script:KalFehler) { "<div class='hinweisbox'>$(HtmlEncode $script:KalFehler)</div>" } else { "" }
+    $hinweis = (@(if ($script:KalFehler) { "<div class='hinweisbox'>$(HtmlEncode $script:KalFehler)</div>" }; if ($script:CnFehler) { "<div class='hinweisbox'>$($script:CnFehler)</div>" }) -join '')
     if ($fehler) { $inhalt = "<div class='fehler'>Fehler beim Laden der Daten:<br><pre>$(HtmlEncode $fehler)</pre></div>" }
     elseif ($liste.Count -eq 0) { $inhalt = "<p class='leise'>Keine offenen Auftr&auml;ge.</p>" }
     else {
@@ -452,11 +461,11 @@ function Build-Auftraege($liste, $fehler) {
             "<tr><td style='white-space:nowrap'>$montage</td>" +
             "<td style='white-space:nowrap'><span class='$artCls'>$($au.Art)</span> <a class='artlink' href='/auftrag?bel=$($au.BelID)'>$(HtmlEncode $au.Beleg)</a></td>" +
             "<td>$(HtmlEncode $au.Kunde)</td><td>$(HtmlEncode $au.Baustelle)</td><td class='num' style='white-space:nowrap'>$(Fmt-kWp $au.kWp)</td><td style='white-space:nowrap'>$lt</td>" +
-            "<td style='text-align:center'>$(Stand-Html $au.Stand 'Gel')</td><td style='text-align:center'>$(Stand-Html $au.Stand 'Ber')</td><td>$($chips -join '')</td></tr>"
+            "<td style='text-align:center'>$(Stand-Html $au.Stand 'Gel')</td><td style='text-align:center'>$(Stand-Html $au.Stand 'Ber')</td><td>$(CN-Chip $au.Cn)</td><td>$($chips -join '')</td></tr>"
         }
         $inhalt = @"
 <table id='tab'>
-<thead><tr><th>Montage</th><th>Auftrag</th><th>Kunde</th><th>Baustelle</th><th class='num'>Anlage</th><th>Liefertermin</th><th>Geliefert</th><th>Berechnet</th><th>Material</th></tr></thead>
+<thead><tr><th>Montage</th><th>Auftrag</th><th>Kunde</th><th>Baustelle</th><th class='num'>Anlage</th><th>Liefertermin</th><th>Geliefert</th><th>Berechnet</th><th>Craftnote</th><th>Material</th></tr></thead>
 <tbody>$($rows -join '')</tbody>
 </table>
 "@
@@ -561,7 +570,7 @@ function Build-AuftragDetail($au, $pos, $fehler) {
     return @"
 $head
 <div class='kopf'><h1><span class='$artCls'>$($au.Art)</span> $(HtmlEncode $au.Beleg) &ndash; $(HtmlEncode $au.Kunde)</h1><div class='meta'>$(StandText)</div></div>
-<div class='steuer'><a class='btn btn2' href='/'>&larr; Offene Auftr&auml;ge</a></div>
+<div class='steuer'><a class='btn btn2' href='/'>&larr; Offene Auftr&auml;ge</a>$(if ($au.Cn) { " <a class='btn btn2' href='$CraftnoteWeb$($au.Cn.P.Id)' target='_blank'>Craftnote &#8599;</a>" })</div>
 <table style='max-width:620px;margin-bottom:8px'><tbody>
 <tr><td>Kunde</td><td>$(HtmlEncode $au.Kunde)</td></tr>
 <tr><td>Baustelle</td><td>$(HtmlEncode (@($au.BaustelleName, $au.Baustelle) | Where-Object { $_ }) -join ', ')</td></tr>
@@ -573,6 +582,8 @@ $head
 </tbody></table>
 <h2>Montagetermine</h2>
 $termine
+<h2>Craftnote</h2>
+$(CN-DetailHtml $au.Cn)
 <h2>Material</h2>
 $material
 <h2>Leistungen</h2>
@@ -663,7 +674,7 @@ function filter(){
 # Hat der Kunde danach einen Auftrag (z.B. ueber eine andere Angebotsvariante), wird das Angebot ausgegraut.
 $SQL_OffeneAngebote = @"
 SELECT k.BelID, CAST(k.Belegjahr AS varchar) + '-' + CAST(k.Belegnummer AS varchar) AS Beleg, k.Belegdatum,
-       k.A0Name1, k.A0Name2, k.A0Ort, k.A1Ort, k.A1Strasse,
+       k.A0Name1, k.A0Name2, k.A0Ort, k.A1Ort, k.A1Strasse, k.A0Empfaenger, k.A0PLZ, k.A1PLZ, k.A0Strasse,
        p.Artikelnummer, p.Bezeichnung1 AS PosBezeichnung, p.Menge, a.Artikelgruppe, a.Stuecklistentyp,
        ab.Beleg AS AuftragDanach
 FROM KHKVKBelege k
@@ -688,7 +699,7 @@ function Build-Angebote($monate, $fehler) {
             if (-not $ang.Contains($id)) {
                 $ort = ([string]$r["A1Ort"]).Trim(); if (-not $ort) { $ort = ([string]$r["A0Ort"]).Trim() }
                 $ang[$id] = @{ BelID = $id; Beleg = [string]$r["Beleg"]; Datum = $r["Belegdatum"]; Kunde = ((@(([string]$r["A0Name1"]).Trim(), ([string]$r["A0Name2"]).Trim()) | Where-Object { $_ }) -join ' ')
-                               Name1 = [string]$r["A0Name1"]; Ort = $ort; kWp = 0.0; Module = 0.0; Teile = @{}; AuftragDanach = $(if ($r["AuftragDanach"] -is [System.DBNull]) { "" } else { [string]$r["AuftragDanach"] }) }
+                               Name1 = [string]$r["A0Name1"]; Ort = $ort; Kto = [string]$r["A0Empfaenger"]; Plz = @(([string]$r["A1PLZ"]).Trim(), ([string]$r["A0PLZ"]).Trim()); Str = $(if (([string]$r["A1Strasse"]).Trim()) { [string]$r["A1Strasse"] } else { [string]$r["A0Strasse"] }); kWp = 0.0; Module = 0.0; Teile = @{}; AuftragDanach = $(if ($r["AuftragDanach"] -is [System.DBNull]) { "" } else { [string]$r["AuftragDanach"] }) }
             }
             $g = $ang[$id]; $gr = [string]$r["Artikelgruppe"]; $m = [double](ToNum $r["Menge"]); $bez = [string]$r["PosBezeichnung"]
             if ($r["Artikelnummer"] -is [System.DBNull]) { continue }
@@ -701,6 +712,7 @@ function Build-Angebote($monate, $fehler) {
             }
         }
         $anzahl = $ang.Count
+        $cn = try { Get-Craftnote } catch { $null }
         $rows = foreach ($g in $ang.Values) {
             $alter = ($heute - ([datetime]$g.Datum).Date).Days
             $tr = @(Kunden-Termine $g.Name1 $termine | Sort-Object { $_.T.Start })
@@ -712,10 +724,10 @@ function Build-Angebote($monate, $fehler) {
             $stil = if ($g.AuftragDanach) { " style='color:#999'" } else { "" }
             $hinweis = if ($g.AuftragDanach) { " <span class='chip da' title='Der Kunde hat nach diesem Angebot einen Auftrag erteilt (z.B. &uuml;ber eine andere Variante)'>Auftrag $(HtmlEncode $g.AuftragDanach)</span>" } else { "" }
             "<tr$stil><td style='white-space:nowrap'>$(([datetime]$g.Datum).ToString('dd.MM.yyyy'))</td><td class='num'>$alter</td><td style='white-space:nowrap'>$(HtmlEncode $g.Beleg)$hinweis</td>" +
-            "<td>$(HtmlEncode $g.Kunde)</td><td>$(HtmlEncode $g.Ort)</td><td style='white-space:nowrap'>$anlage</td><td>$chips</td><td>$terminTxt</td></tr>"
+            "<td>$(HtmlEncode $g.Kunde)</td><td>$(HtmlEncode $g.Ort)</td><td style='white-space:nowrap'>$anlage</td><td>$chips</td><td>$(CN-Chip (CN-Finde $cn $g.Name1 $g.Kto $g.Plz $g.Str))</td><td>$terminTxt</td></tr>"
         }
         $inhalt = if ($anzahl) {
-            "<table class='filtertab'><thead><tr><th>Datum</th><th class='num'>Tage</th><th>Angebot</th><th>Kunde</th><th>Ort</th><th>Anlage</th><th>Umfang</th><th>Kalender</th></tr></thead><tbody>$($rows -join '')</tbody></table>"
+            "<table class='filtertab'><thead><tr><th>Datum</th><th class='num'>Tage</th><th>Angebot</th><th>Kunde</th><th>Ort</th><th>Anlage</th><th>Umfang</th><th>Craftnote</th><th>Kalender</th></tr></thead><tbody>$($rows -join '')</tbody></table>"
         } else { "<p class='leise'>Keine offenen Angebote in diesem Zeitraum.</p>" }
     }
     $knoepfe = (@(3, 6, 12) | ForEach-Object { $cls = if ($_ -eq $monate) { 'btn' } else { 'btn btn2' }; "<a class='$cls' href='/angebote?monate=$_'>$_ Monate</a>" }) -join ' '
@@ -723,6 +735,7 @@ function Build-Angebote($monate, $fehler) {
 $head
 <div class='kopf'><h1>Offene Angebote</h1><div class='meta'>$(StandText) &middot; $anzahl Angebote</div></div>
 <div class='steuer'>$knoepfe <input class='suche' id='suche' placeholder='Filtern ...' onkeyup='filter()'></div>
+$(if ($script:CnFehler) { "<div class='hinweisbox'>$($script:CnFehler)</div>" })
 $(if ($script:KalFehler) { "<div class='hinweisbox'>$(HtmlEncode $script:KalFehler)</div>" })
 $inhalt
 <script>
@@ -2244,8 +2257,9 @@ Regeln:
 - Keine Preise, Betraege oder Werte - die Werkzeuge liefern bewusst keine.
 - Wird ein Artikel nur beschrieben (nicht per Nummer genannt), zuerst artikel_suchen. Bei mehreren passenden Treffern kurz die Kandidaten nennen und nachfragen, statt zu raten.
 - Antworte auf Deutsch mit korrekten Umlauten, kurz und konkret. Zuerst die Antwort in ein bis zwei Saetzen, dann bei Bedarf Details als kurze Liste. Tabellen nur wenn wirklich hilfreich (max. 6 Spalten). Datum als TT.MM.JJJJ.
-- Verlinke passende Seiten als Markdown-Links mit den relativen Pfaden aus den Werkzeugergebnissen (Zeilen "Link:" oder Pfade in Klammern), z.B. [2026-40147](/auftrag?bel=9612). Keine externen Links.
+- Verlinke passende Seiten als Markdown-Links mit den relativen Pfaden aus den Werkzeugergebnissen (Zeilen "Link:" oder Pfade in Klammern), z.B. [2026-40147](/auftrag?bel=9612). Craftnote-Projekte als Link auf https://app.mycraftnote.de/... wie im Werkzeugergebnis, sonst keine externen Links.
 - Du kannst nur lesen. Buchungen, Aenderungen, Termine oder Bestellungen kannst du nicht ausfuehren.
+- Craftnote ist die Projekt-App (Projektstatus von Anfrage ueber Angebot, Foerderung, Auftrag terminiert, EVU-Unterlagen, Zaehlerwechsel, Inbetriebnahme bis abgeschlossen; dazu Notizen, Dateien, Zeiten). Craftnote-Projekte werden den Sage-Auftraegen ueber die E-Mail-Adresse des Kunden zugeordnet, sonst ueber Name und PLZ (dann ggf. unsicher). Aufgaben und Chat aus Craftnote sind nicht verfuegbar.
 
 Begriffe: AB = Auftragsbestaetigung, RES = Reservierungsbestaetigung (zaehlt wie ein Auftrag), AB/RES = AB aus einer Reservierung. Montagetermine stehen im Online-Kalender (Titel = Kundenname, Kategorie = Monteur/Team) und werden den Auftraegen ueber den Namen zugeordnet; "unsicher" heisst, nur der Nachname passt - dann darauf hinweisen. Planungstermin eines Auftrags = naechster Montagetermin, sonst der Liefertermin. Material-Status: da = aus Lagerbestand gedeckt, bestellt = durch eine offene Bestellung gedeckt (mit Liefertermin), fehlt = weder Bestand noch Bestellung, kein Lagerartikel = wird je Auftrag beschafft (z.B. Montagesystem LORENZ). Bestand und Bestellungen werden den Auftraegen in der Reihenfolge ihrer Planungstermine zugeteilt. Stueckliste = Set (z.B. Speicher), dessen Bestand und Bedarf ueber die Bestandteile laufen. kWp = Anlagenleistung aus den Modulpositionen. Geliefert/berechnet = wie viele Positionen eines Auftrags schon geliefert bzw. in Rechnung gestellt sind.
 
@@ -2289,6 +2303,10 @@ $ChatToolsJson = @'
     "lager":{"type":"string","description":"Lagerkennung oder Platz, z.B. A, A 1/2/3, Warenlager"},
     "person":{"type":"string","description":"Name der Person"},
     "art":{"type":"string","enum":["um","zu","ab"],"description":"um = Umbuchungen, zu = Zugaenge, ab = Entnahmen"}}}},
+ {"name":"craftnote_projekte","description":"Projekte aus Craftnote (Projekt-App) mit Status, Ort, letzter Aenderung, Notiz, Link und zugeordnetem offenen Sage-Auftrag; dazu die Anzahl je Status. Fuer Fragen wie: welche Projekte warten auf Foerderung, wo sind EVU-Unterlagen eingereicht, wie viele Angebote sind versendet, Stand bei Kunde X in Craftnote.",
+  "input_schema":{"type":"object","properties":{
+    "status":{"type":"string","description":"Teil des Statusnamens, z.B. Foerderung, EVU, Angebot, Auftrag vorhanden, Inbetrieb, abgeschlossen"},
+    "text":{"type":"string","description":"Teil von Projektname, Ort oder PLZ"}}}},
  {"name":"lagerplatz_inhalt","description":"Welche Artikel mit welchem Bestand auf Lagerplaetzen liegen, deren Lagerkennung so beginnt (oder genau auf einem Platz wie A 1/2/3).",
   "input_schema":{"type":"object","properties":{"lager":{"type":"string","description":"Lagerkennung oder Platz, z.B. A, A 1/2, Warenlager"}},"required":["lager"]}}
 ]
@@ -2454,6 +2472,7 @@ function Invoke-ChatTool($name, $inp) {
                 (-not $bis -or $_.Planung -le $bis) -and (-not $nurFehlt -or @($_.Material | Where-Object { $_.Status -eq 'fehlt' }).Count)
             })
             if ($treffer.Count -eq 0) { return "Keine offenen Auftraege fuer diese Auswahl ($($liste.Count) offene Auftraege insgesamt)." }
+            try { $null = Craftnote-Zuordnen $treffer } catch {}
             $gruppen = @($MaterialGruppen.Values | Select-Object -Unique) + 'Sonstiges'
             $z = foreach ($au in ($treffer | Select-Object -First 60)) {
                 $mat = foreach ($g in $gruppen) {
@@ -2464,9 +2483,9 @@ function Invoke-ChatTool($name, $inp) {
                     elseif ($b.Count) { "$gt bestellt (" + (($b | ForEach-Object { "$($_.Art) $(ChatMatStatus $_)" }) -join '; ') + ')' }
                     elseif (@($zl | Where-Object { $_.Status -eq 'da' }).Count) { "$gt da" } else { "$gt kein Lagerartikel" }
                 }
-                "$(ChatTermin $au.Naechster) | $($au.Art) $($au.Beleg) (/auftrag?bel=$($au.BelID)) | $($au.Kunde) | $($au.Baustelle) | $(if ($au.kWp) { [math]::Round($au.kWp, 1) }) | $(ChatDat $au.Liefertermin) | $(ChatStand $au.Stand 'Gel') | $(ChatStand $au.Stand 'Ber') | $(@($mat) -join ', ')"
+                "$(ChatTermin $au.Naechster) | $($au.Art) $($au.Beleg) (/auftrag?bel=$($au.BelID)) | $($au.Kunde) | $($au.Baustelle) | $(if ($au.kWp) { [math]::Round($au.kWp, 1) }) | $(ChatDat $au.Liefertermin) | $(ChatStand $au.Stand 'Gel') | $(ChatStand $au.Stand 'Ber') | $(if ($au.Cn) { "$($au.Cn.P.Status)$(if (-not $au.Cn.Sicher) { ' (unsicher)' })" } else { '-' }) | $(@($mat) -join ', ')"
             }
-            return "$($treffer.Count) offene Auftraege$(if ($treffer.Count -gt 60) { ', die ersten 60' }), sortiert: zuerst mit kommendem Montagetermin, dann nach Liefertermin. Link Liste: /`nNaechster Montagetermin (Team) | Auftrag (Link) | Kunde | Baustelle | kWp | Liefertermin | geliefert | berechnet | Material`n" + ($z -join "`n")
+            return "$($treffer.Count) offene Auftraege$(if ($treffer.Count -gt 60) { ', die ersten 60' }), sortiert: zuerst mit kommendem Montagetermin, dann nach Liefertermin. Link Liste: /`nNaechster Montagetermin (Team) | Auftrag (Link) | Kunde | Baustelle | kWp | Liefertermin | geliefert | berechnet | Craftnote-Status | Material`n" + ($z -join "`n")
         }
         'auftrag' {
             $liste = Chat-Auftraege
@@ -2483,7 +2502,9 @@ function Invoke-ChatTool($name, $inp) {
             }
             $lei = foreach ($l in $pos.Leistungen) { "$($l.Bez) | $(FmtZahl $l.Soll) | $(FmtZahl $l.Gel) | $(FmtZahl $l.Ber)" }
             $folge = (@($au.Folgebelege | ForEach-Object { "$($_['Belegart']) $($_['Beleg']) ($(ChatDat $_['Belegdatum']))" })) -join '; '
-            return "$($au.Art) $($au.Beleg) - $($au.Kunde)`nLink: /auftrag?bel=$($au.BelID)`nBaustelle: $((@($au.BaustelleName, $au.Baustelle) | Where-Object { $_ }) -join ', ')`nAuftragsdatum $(ChatDat $au.Datum), Liefertermin $(ChatDat $au.Liefertermin), Anlage $(if ($au.kWp) { [math]::Round($au.kWp, 1) } else { '-' }) kWp`nGeliefert: $(ChatStand $au.Stand 'Gel'), berechnet: $(ChatStand $au.Stand 'Ber'). Lieferscheine/Rechnungen: $(if ($folge) { $folge } else { 'keine' })`nMontagetermine:`n$termine`nMaterial: Gruppe | Artikel | Bezeichnung | Menge | geliefert | berechnet | Status`n" + ($mat -join "`n") + "`nLeistungen: Leistung | Menge | geliefert | berechnet`n" + ($lei -join "`n")
+            try { $null = Craftnote-Zuordnen @($au) } catch {}
+            $cnTxt = if ($au.Cn) { $p = $au.Cn.P; "Projekt $($p.Name), Status $($p.Status), zugeordnet ueber $($au.Cn.Wie)$(if (-not $au.Cn.Sicher) { ' (unsicher)' }), geaendert $(ChatDat $p.Geaendert), Link $CraftnoteWeb$($p.Id)$(if ($p.Notiz) { "`nCraftnote-Notiz ($($p.NotizAutor)): $($p.Notiz)" })" } else { "kein Projekt gefunden$(if ($script:CnFehler) { ' (' + (ChatText $script:CnFehler) + ')' })" }
+            return "$($au.Art) $($au.Beleg) - $($au.Kunde)`nLink: /auftrag?bel=$($au.BelID)`nCraftnote: $cnTxt`nBaustelle: $((@($au.BaustelleName, $au.Baustelle) | Where-Object { $_ }) -join ', ')`nAuftragsdatum $(ChatDat $au.Datum), Liefertermin $(ChatDat $au.Liefertermin), Anlage $(if ($au.kWp) { [math]::Round($au.kWp, 1) } else { '-' }) kWp`nGeliefert: $(ChatStand $au.Stand 'Gel'), berechnet: $(ChatStand $au.Stand 'Ber'). Lieferscheine/Rechnungen: $(if ($folge) { $folge } else { 'keine' })`nMontagetermine:`n$termine`nMaterial: Gruppe | Artikel | Bezeichnung | Menge | geliefert | berechnet | Status`n" + ($mat -join "`n") + "`nLeistungen: Leistung | Menge | geliefert | berechnet`n" + ($lei -join "`n")
         }
         'materialbedarf' {
             $liste = Chat-Auftraege
@@ -2677,6 +2698,21 @@ ORDER BY lpb.Lagerkennung, lp.Dimension1, lp.Dimension2, lp.Dimension3, lpb.Arti
             $z = foreach ($r in $t.Rows) { "$(Fmt-Platz $r['Lagerkennung'] $r['Dimension1'] $r['Dimension2'] $r['Dimension3']) | $($r['Artikelnummer']) | $($r['Bezeichnung1']) | $(FmtZahl $r['Bestand'])" }
             return "$($t.Rows.Count) Eintraege$(if ($t.Rows.Count -ge 200) { ' (Limit 200 erreicht)' }).`nLagerplatz | Artikel | Bezeichnung | Bestand`n" + ($z -join "`n")
         }
+        'craftnote_projekte' {
+            $cn = Get-Craftnote
+            if (-not $cn) { return "Craftnote nicht verfuegbar: $(ChatText $script:CnFehler)" }
+            $stF = ChatArg $inp 'status'; $txt = ChatArg $inp 'text'
+            $au = @(Chat-Auftraege); try { $null = Craftnote-Zuordnen $au } catch {}
+            $zuAu = @{}; foreach ($a in $au) { if ($a.Cn) { $zuAu[$a.Cn.P.Id] = $a } }
+            $alle = @($cn.Projekte | Where-Object { -not $_.Archiviert })
+            $zaehl = (@($alle | Group-Object Status | Sort-Object Count -Descending | ForEach-Object { "$($_.Count) $(if ($_.Name) { $_.Name } else { 'ohne Status' })" })) -join '; '
+            $t = @($alle | Where-Object { (-not $stF -or $_.Status -like "*$stF*") -and (-not $txt -or $_.Name -like "*$txt*" -or $_.Ort -like "*$txt*" -or $_.Plz -like "$txt*") } | Sort-Object { - $(if ($_.Geaendert) { $_.Geaendert.Ticks } else { 0 }) })
+            $z = foreach ($p in ($t | Select-Object -First 80)) {
+                $a = $zuAu[$p.Id]
+                "$($p.Name) | $($p.Plz) $($p.Ort) | $($p.Status) | $(ChatDat $p.Geaendert) | $CraftnoteWeb$($p.Id) | $(if ($a) { "$($a.Beleg) (/auftrag?bel=$($a.BelID))" } else { '-' })$(if ($p.Notiz) { ' | Notiz: ' + $(if ($p.Notiz.Length -gt 150) { $p.Notiz.Substring(0, 150) + '...' } else { $p.Notiz }) })"
+            }
+            return "Craftnote-Projekte gesamt (nicht archiviert): $($alle.Count). Je Status: $zaehl`nTreffer: $($t.Count)$(if ($t.Count -gt 80) { ', die neuesten 80' }). Abgleich mit Sage: /abgleich`nProjekt | Ort | Status | zuletzt geaendert | Craftnote-Link | offener Sage-Auftrag`n" + ($z -join "`n")
+        }
         default { return "Unbekanntes Werkzeug: $name" }
     }
 }
@@ -2695,6 +2731,7 @@ function ChatSchrittText($name, $inp) {
         'offene_bestellungen' { "Lese offene Bestellungen &hellip;" }
         'lagerbewegungen'     { "Lese Lagerbewegungen &hellip;" }
         'lagerplatz_inhalt'   { "Lese Lagerplatz &hellip;" }
+        'craftnote_projekte'  { "Schaue in Craftnote &hellip;" }
         default               { "Frage Sage ab &hellip;" }
     }
 }
@@ -2848,6 +2885,7 @@ $ChatWidgetHtml = @'
     s = s.replace(/(^|[^*])\*([^*\s][^*]*)\*/g, '$1<i>$2</i>');
     s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
     s = s.replace(/\[([^\]]+)\]\((\/[^)\s]*)\)/g, function(m, t, h){ return "<a href='" + h.replace(/'/g,'%27') + "'>" + t + '</a>'; });
+    s = s.replace(/\[([^\]]+)\]\((https:\/\/app\.mycraftnote\.de\/[^)\s]*)\)/g, function(m, t, h){ return "<a href='" + h.replace(/'/g,'%27') + "' target='_blank'>" + t + ' &#8599;</a>'; });
     return s;
   }
   function md(text){
@@ -3090,6 +3128,247 @@ $head
 "@
 }
 
+
+# ---------- Craftnote (Projekt-App): Status, Notizen, Dateien, Zeiten - NUR LESEN ----------
+# API-Schluessel als Umgebungsvariable CRAFTNOTE_API_KEY (wie ein Passwort behandeln, nie ins Skript).
+# Der Schluessel darf in Craftnote auch schreiben - hier werden ausschliesslich GET-Abfragen verwendet.
+# Aufgaben und Chat-Nachrichten brauchen den kostenpflichtigen "Advanced API access" und fehlen daher.
+# Zuordnung zu Sage: 1. gleiche E-Mail-Adresse (Kunde in Sage / Kontakt im Projekt), 2. Nachname + PLZ.
+$CraftnoteBasis = 'https://functions.craftnote.cloud/api/v1'
+$CraftnoteWeb = 'https://app.mycraftnote.de/#/project?id='
+$CraftnoteCacheMinuten = 15
+$CraftnoteEigeneMails = '(?i)@(leyendecker\.solar|lorenz-ms\.de)$'   # eigene Mitarbeiter als Projektkontakt - nicht zuordnen
+$SQL_KundenMails = @"
+SELECT kk.Kto, LOWER(LTRIM(RTRIM(ad.EMail))) AS Mail FROM KHKKontokorrent kk
+INNER JOIN KHKAdressen ad ON ad.Adresse = kk.Adresse AND ad.Mandant = kk.Mandant
+WHERE kk.Mandant = $Mandant AND ad.EMail LIKE '%@%'
+UNION
+SELECT kk.Kto, LOWER(LTRIM(RTRIM(ap.EMail))) FROM KHKKontokorrent kk
+INNER JOIN KHKAnsprechpartner ap ON ap.Adresse = kk.Adresse AND ap.Mandant = kk.Mandant
+WHERE kk.Mandant = $Mandant AND ap.EMail LIKE '%@%'
+"@
+# letzter Auftrag je Kunde (fuer den Abgleich: Craftnote "Auftrag terminiert", in Sage aber nichts offen)
+$SQL_LetzteAuftraege = @"
+SELECT x.Kto, x.Beleg, x.BelID, x.Belegdatum, x.Erledigt FROM (
+    SELECT k.A0Empfaenger AS Kto, CAST(k.Belegjahr AS varchar) + '-' + CAST(k.Belegnummer AS varchar) AS Beleg, k.BelID, k.Belegdatum,
+           CASE WHEN v.GGErfuellt = 0 THEN 0 ELSE 1 END AS Erledigt,
+           ROW_NUMBER() OVER (PARTITION BY k.A0Empfaenger ORDER BY k.Belegdatum DESC, k.BelID DESC) AS nr
+    FROM KHKVKBelege k INNER JOIN KHKVKVorgaenge v ON v.VorID = k.VorID AND v.Mandant = k.Mandant
+    WHERE k.Mandant = $Mandant AND (k.Belegart LIKE 'Auftragsbest%' OR k.Belegart LIKE 'Reservierungsbest%' OR k.Belegart = 'AB (aus Res)')
+) x WHERE x.nr = 1
+"@
+
+function CN-Abruf($pfad) {
+    $key = Umgebung 'CRAFTNOTE_API_KEY'
+    if (-not $key) { throw 'Craftnote-Schluessel nicht hinterlegt (CRAFTNOTE_API_KEY)' }
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+    $wc = New-Object System.Net.WebClient; $wc.Encoding = [System.Text.Encoding]::UTF8
+    $wc.Headers.Add('X-CN-API-KEY', $key.Trim()); $wc.Headers.Add('Accept', 'application/json')
+    try { return ($wc.DownloadString("$CraftnoteBasis$pfad") | ConvertFrom-Json) } finally { $wc.Dispose() }
+}
+# Liste ueber alle Seiten (Token); das Listenfeld heisst je Endpunkt anders (data, files, times, members)
+function CN-Liste($pfad) {
+    $erg = New-Object System.Collections.ArrayList; $nach = $null
+    for ($i = 0; $i -lt 100; $i++) {
+        $trenn = if ($pfad -match '\?') { '&' } else { '?' }
+        $r = CN-Abruf "$pfad$($trenn)paginationMode=token&limit=100$(if ($nach) { "&startAfter=$nach" })"
+        $feld = @($r.PSObject.Properties | Where-Object { @('data', 'files', 'times', 'members', 'projects') -contains $_.Name } | Select-Object -First 1)
+        $items = if ($feld.Count) { @($feld[0].Value) } else { @() }
+        foreach ($x in $items) { if ($null -ne $x) { [void]$erg.Add($x) } }
+        $nach = if ($r.PSObject.Properties['startAfter']) { [string]$r.startAfter } else { '' }
+        if (-not $nach -or $items.Count -lt 100) { break }
+    }
+    return $erg.ToArray()
+}
+function CN-Datum($u) {
+    if (-not $u) { return $null }
+    $v = [double]$u; if ($v -gt 1e11) { $v = $v / 1000 }
+    return [DateTimeOffset]::FromUnixTimeSeconds([long]$v).LocalDateTime
+}
+
+# Alle Projekte + Status + Kunden-Mails aus Sage, 15 Minuten zwischengespeichert. Bei Fehler bleibt der letzte Stand.
+$script:CnCache = $null; $script:CnZeit = [datetime]::MinValue; $script:CnFehler = ''
+function Get-Craftnote {
+    if ($script:CnCache -and ((Get-Date) - $script:CnZeit).TotalMinutes -lt $CraftnoteCacheMinuten) { return $script:CnCache }
+    if (-not $script:CnCache -and ((Get-Date) - $script:CnZeit).TotalMinutes -lt 1) { return $null }   # nach Fehler kurz warten
+    if (-not (Umgebung 'CRAFTNOTE_API_KEY')) { $script:CnFehler = 'Craftnote-Schl&uuml;ssel nicht hinterlegt (CRAFTNOTE_API_KEY)'; return $null }
+    try {
+        $status = [ordered]@{}; foreach ($s in @((CN-Abruf '/company/settings/projectstatus').data)) { $status[[string]$s.id] = [string]$s.name }
+        $proj = foreach ($p in (CN-Liste '/projects')) {
+            if ($p.projectType -ne 'PROJECT') { continue }
+            $pm = @(@($p.billingEmail) + @($p.contacts | ForEach-Object { $_.emails }) | Where-Object { $_ } | ForEach-Object { ([string]$_).Trim().ToLower() } | Where-Object { $_ -notmatch $CraftnoteEigeneMails } | Select-Object -Unique)
+            [pscustomobject]@{ Id = [string]$p.id; Name = [string]$p.name; Norm = (Name-Norm $p.name); Plz = ([string]$p.zipcode).Trim(); Strasse = (Name-Norm $p.street); Ort = ([string]$p.city).Trim()
+                Mails = $pm; StatusId = [string]$p.statusId; Status = $(if ($p.statusId -and $status.Contains([string]$p.statusId)) { $status[[string]$p.statusId] } else { '' })
+                Archiviert = [bool]$p.archived; Erstellt = (CN-Datum $p.creationDate); Geaendert = (CN-Datum $p.lastEditedDate); Start = (CN-Datum $p.startDate)
+                Notiz = ([string]$p.noteContent).Trim(); NotizAutor = [string]$p.noteAuthor; NotizZeit = (CN-Datum $p.noteTimestamp) }
+        }
+        # Indizes fuer die Zuordnung
+        $nachMail = @{}; $nachPlz = @{}
+        foreach ($p in $proj) {
+            if ($p.Archiviert) { continue }
+            foreach ($m in $p.Mails) { if (-not $nachMail.ContainsKey($m)) { $nachMail[$m] = New-Object System.Collections.ArrayList }; [void]$nachMail[$m].Add($p) }
+            if ($p.Plz) { if (-not $nachPlz.ContainsKey($p.Plz)) { $nachPlz[$p.Plz] = New-Object System.Collections.ArrayList }; [void]$nachPlz[$p.Plz].Add($p) }
+        }
+        $kMails = @{}; $mailKto = @{}
+        foreach ($r in (Run-Query $SQL_KundenMails $null).Rows) {
+            $k = [string]$r['Kto']; $m = [string]$r['Mail']
+            if (-not $kMails.ContainsKey($k)) { $kMails[$k] = New-Object System.Collections.ArrayList }; [void]$kMails[$k].Add($m)
+            if (-not $mailKto.ContainsKey($m)) { $mailKto[$m] = $k }
+        }
+        $script:CnCache = @{ Projekte = @($proj); Status = $status; NachMail = $nachMail; NachPlz = $nachPlz; KundenMails = $kMails; MailKto = $mailKto }
+        $script:CnZeit = Get-Date; $script:CnFehler = ''
+    } catch {
+        $script:CnFehler = "Craftnote nicht erreichbar: $(HtmlEncode $_.Exception.Message)"
+        if (-not $script:CnCache) { $script:CnZeit = Get-Date }
+    }
+    return $script:CnCache
+}
+
+# Statusgruppe fuer Farbe, Reihenfolge und Abgleich (Statusnamen kommen aus Craftnote)
+function CN-Gruppe($status) {
+    switch -regex ([string]$status) {
+        '^$' { return '' }
+        'abgeschlossen' { return 'fertig' }
+        'Absage|nicht gew' { return 'absage' }
+        'Inbetrieb' { return 'inbetrieb' }
+        'rderung' { return 'foerderung' }
+        'Anfrage|Angebot' { return 'vertrieb' }
+        'Service' { return 'service' }
+        default { return 'auftrag' }
+    }
+}
+$CnStatusRang = @{ 'auftrag' = 0; 'inbetrieb' = 1; 'foerderung' = 2; 'service' = 3; 'vertrieb' = 4; 'fertig' = 5; 'absage' = 6; '' = 7 }
+function CN-Kurz($s) {
+    return ([string]$s) -replace 'Auftrag vorhanden und Terminiert', 'Auftrag terminiert' -replace 'Angebot erstellt und versendet', 'Angebot versendet' `
+        -replace 'Termin zum Z(.)hlerwechsel vereinbart', 'Z$1hlerwechsel vereinbart' -replace 'EVU Unterlagen eingereicht', 'EVU eingereicht' -replace '^zu weit oder zu klein, ', ''
+}
+
+# Craftnote-Projekt zu einem Sage-Kunden. Rueckgabe @{ P; Sicher; Wie; Anzahl } oder $null.
+function CN-Finde($cn, $name1, $kto, $plzListe, $strasse) {
+    if (-not $cn) { return $null }
+    $wahl = { param($k) @($k | Sort-Object { $CnStatusRang[(CN-Gruppe $_.Status)] }, { if ($_.Geaendert) { - $_.Geaendert.Ticks } else { 0 } }) }
+    # 1. E-Mail
+    $k = New-Object System.Collections.ArrayList
+    if ($kto -and $cn.KundenMails.ContainsKey([string]$kto)) {
+        foreach ($m in $cn.KundenMails[[string]$kto]) { if ($cn.NachMail.ContainsKey($m)) { foreach ($p in $cn.NachMail[$m]) { if (-not $k.Contains($p)) { [void]$k.Add($p) } } } }
+    }
+    if ($k.Count) { return @{ P = (& $wahl $k)[0]; Sicher = $true; Wie = 'E-Mail'; Anzahl = $k.Count } }
+    # 2. Nachname + PLZ (Firmen: ein Namenswort + PLZ)
+    $woerter = @(((Name-Norm $name1) -split '[^a-z]+') | Where-Object { $_.Length -ge 3 -and $NamenStopp -notcontains $_ })
+    if (-not $woerter.Count) { return $null }
+    $firma = ([string]$name1 -match $FirmenMuster)
+    $nach = if ($firma) { $woerter } elseif ([string]$name1 -match ',') { @($woerter[0]) } else { @($woerter[-1]) }
+    $vor = if (-not $firma -and $woerter.Count -ge 2) { if ([string]$name1 -match ',') { $woerter[1] } else { $woerter[0] } } else { $null }
+    $k = New-Object System.Collections.ArrayList
+    foreach ($plz in @($plzListe | Where-Object { $_ } | ForEach-Object { ([string]$_).Trim() } | Select-Object -Unique)) {
+        if (-not $cn.NachPlz.ContainsKey($plz)) { continue }
+        foreach ($p in $cn.NachPlz[$plz]) { foreach ($n in $nach) { if ($p.Norm -match "\b$n\b" -and -not $k.Contains($p)) { [void]$k.Add($p) } } }
+    }
+    if ($k.Count -eq 0) { return $null }
+    $k = @($k)
+    if ($k.Count -gt 1 -and $vor) { $v = @($k | Where-Object { $_.Norm -match "\b$vor\b" }); if ($v.Count) { $k = $v } }
+    if ($k.Count -gt 1 -and $strasse) {
+        $sn = (Name-Norm $strasse) -replace '[^a-z]', ''
+        if ($sn.Length -ge 4) { $an = $sn.Substring(0, [math]::Min(8, $sn.Length)); $s = @($k | Where-Object { ($_.Strasse -replace '[^a-z]', '') -like "$an*" }); if ($s.Count) { $k = $s } }
+    }
+    return @{ P = (& $wahl $k)[0]; Sicher = ($k.Count -eq 1); Wie = 'Name und PLZ'; Anzahl = $k.Count }
+}
+function Craftnote-Zuordnen($liste) {
+    $cn = Get-Craftnote
+    foreach ($au in $liste) { $au.Cn = $(if ($cn) { CN-Finde $cn $au.Name1 $au.Kto $au.Plz $au.StrasseRoh } else { $null }) }
+    return $cn
+}
+
+# Status als Chip mit Link in die Craftnote-Web-App
+function CN-Chip($z) {
+    if (-not $z) { return "" }
+    $p = $z.P; $g = CN-Gruppe $p.Status
+    $u = if (-not $z.Sicher) { " <span class='unsicher' title='$($z.Anzahl) Craftnote-Projekte passen zu Name und PLZ &ndash; bitte pr&uuml;fen'>?</span>" } else { "" }
+    return "<a class='cn cn-$g' href='$CraftnoteWeb$($p.Id)' target='_blank' title='Craftnote: $(HtmlEncode $p.Name) &ndash; $(HtmlEncode $p.Status) (zugeordnet &uuml;ber $($z.Wie))'>$(HtmlEncode (CN-Kurz $(if ($p.Status) { $p.Status } else { 'ohne Status' })))</a>$u"
+}
+
+# Bereich "Craftnote" auf der Auftragsseite: Projekt, Status, Notiz, Mitglieder, Dateien je Ordner, Zeiten
+function CN-DetailHtml($z) {
+    if (-not $z) {
+        if ($script:CnFehler) { return "<p class='leise'>$($script:CnFehler)</p>" }
+        return "<p class='leise'>Kein passendes Craftnote-Projekt gefunden (weder &uuml;ber die E-Mail-Adresse noch &uuml;ber Name und PLZ).</p>"
+    }
+    $p = $z.P; $d = { param($x) if ($x -is [datetime]) { $x.ToString('dd.MM.yyyy') } else { '' } }
+    $zeilen = New-Object System.Collections.ArrayList
+    [void]$zeilen.Add("<tr><td>Projekt</td><td><a class='artlink' href='$CraftnoteWeb$($p.Id)' target='_blank'>$(HtmlEncode $p.Name) &#8599;</a> <span class='leise'>zugeordnet &uuml;ber $($z.Wie)$(if ($z.Anzahl -gt 1) { ", $($z.Anzahl) Projekte passen &ndash; bitte pr&uuml;fen" })</span></td></tr>")
+    [void]$zeilen.Add("<tr><td>Status</td><td>$(CN-Chip $z)</td></tr>")
+    [void]$zeilen.Add("<tr><td>Angelegt / ge&auml;ndert</td><td>$(& $d $p.Erstellt) / $(& $d $p.Geaendert)$(if ($p.Start) { " &middot; Start $(& $d $p.Start)" })</td></tr>")
+    if ($p.Notiz) { [void]$zeilen.Add("<tr><td>Notiz</td><td style='white-space:pre-wrap'>$(HtmlEncode $p.Notiz)<div class='leise'>$(HtmlEncode $p.NotizAutor) $(& $d $p.NotizZeit)</div></td></tr>") }
+    try {
+        $mit = @(CN-Liste "/projects/$($p.Id)/members" | ForEach-Object { ("$($_.name) $($_.lastname)").Trim() } | Where-Object { $_ })
+        if ($mit.Count) { [void]$zeilen.Add("<tr><td>Projektmitglieder</td><td>$(HtmlEncode ($mit -join ', '))</td></tr>") }
+        $zeiten = @(CN-Liste "/projects/$($p.Id)/times" | Where-Object { $_.state -ne 'deleted' })
+        if ($zeiten.Count) {
+            $jeP = [ordered]@{}; foreach ($t in $zeiten) { $n = [string]$t.userName; $jeP[$n] = [double]$jeP[$n] + [double]$t.workDuration }
+            $summe = 0.0; foreach ($v in $jeP.Values) { $summe += $v }
+            $txt = (@($jeP.Keys | Sort-Object { - $jeP[$_] } | ForEach-Object { "$(HtmlEncode $_) $(([math]::Round($jeP[$_] / 3600, 1)).ToString('0.#', [Globalization.CultureInfo]'de-DE')) h" })) -join ' &middot; '
+            [void]$zeilen.Add("<tr><td>Erfasste Zeit</td><td><b>$(([math]::Round($summe / 3600, 1)).ToString('0.#', [Globalization.CultureInfo]'de-DE')) h</b> &middot; $txt</td></tr>")
+        }
+        $dateien = @(CN-Liste "/projects/$($p.Id)/files")
+        $ordner = @{}; foreach ($x in $dateien) { if ($x.type -eq 'FOLDER') { $ordner[[string]$x.id] = $x } }
+        $oben = { param($fid) $n = 0; while ($fid -and $ordner.ContainsKey($fid) -and $ordner[$fid].folderId -and $n -lt 10) { $fid = [string]$ordner[$fid].folderId; $n++ }; $fid }
+        $gruppen = [ordered]@{}
+        foreach ($x in ($dateien | Where-Object { $_.type -ne 'FOLDER' } | Sort-Object { - [double]$_.creationTimestamp })) {
+            $o = & $oben ([string]$x.folderId); $name = if ($o -and $ordner.ContainsKey($o)) { [string]$ordner[$o].name } else { 'ohne Ordner' }
+            if (-not $gruppen.Contains($name)) { $gruppen[$name] = New-Object System.Collections.ArrayList }; [void]$gruppen[$name].Add($x)
+        }
+        if ($gruppen.Count) {
+            $teile = foreach ($name in ($gruppen.Keys | Sort-Object)) {
+                $liste = @($gruppen[$name] | ForEach-Object { "<div><a class='artlink' href='/cndatei?id=$($_.id)' target='_blank'>$(HtmlEncode $_.name)</a> <span class='leise'>$(& $d (CN-Datum $_.creationTimestamp))</span></div>" })
+                "<details><summary>$(HtmlEncode $name) <span class='leise'>($($gruppen[$name].Count))</span></summary><div style='padding:4px 0 6px 16px'>$($liste -join '')</div></details>"
+            }
+            [void]$zeilen.Add("<tr><td>Dateien</td><td>$($teile -join '')</td></tr>")
+        } else { [void]$zeilen.Add("<tr><td>Dateien</td><td class='leise'>keine</td></tr>") }
+    } catch { [void]$zeilen.Add("<tr><td>Details</td><td class='leise'>Craftnote-Details nicht abrufbar: $(HtmlEncode $_.Exception.Message)</td></tr>") }
+    return "<table style='max-width:900px'><tbody>$($zeilen -join '')</tbody></table>"
+}
+
+# ---------- Abgleich Sage <-> Craftnote ----------
+function Build-Abgleich($liste, $cn, $fehler) {
+    $head = Page-Head "Solar Dispo - Abgleich Craftnote"
+    $heute = (Get-Date).Date
+    if ($fehler) { return "$head<div class='fehler'>Fehler beim Laden der Daten:<br><pre>$(HtmlEncode $fehler)</pre></div></body></html>" }
+    if (-not $cn) { return "$head<div class='kopf'><h1>Abgleich Craftnote</h1></div><div class='hinweisbox'>$($script:CnFehler)</div></body></html>" }
+    $auZelle = { param($au) "<span class='$(if ($au.Art -like '*RES*') { 'art res' } else { 'art' })'>$($au.Art)</span> <a class='artlink' href='/auftrag?bel=$($au.BelID)'>$(HtmlEncode $au.Beleg)</a>" }
+    $planZelle = { param($au) if ($au.Naechster) { Termin-Html $au.Naechster $false } elseif ($au.Liefertermin) { "<span class='leise'>Liefertermin</span> $($au.Liefertermin.ToString('dd.MM.yyyy'))" } else { "" } }
+    # A: in Sage offen, in Craftnote schon fertig/abgesagt bzw. noch im Vertrieb
+    $a = @($liste | Where-Object { $_.Cn -and @('fertig', 'absage', 'vertrieb') -contains (CN-Gruppe $_.Cn.P.Status) })
+    $rowsA = foreach ($au in $a) { "<tr><td style='white-space:nowrap'>$(& $auZelle $au)</td><td>$(HtmlEncode $au.Kunde)</td><td style='white-space:nowrap'>$(& $planZelle $au)</td><td style='text-align:center'>$(Stand-Html $au.Stand 'Gel')</td><td style='text-align:center'>$(Stand-Html $au.Stand 'Ber')</td><td>$(CN-Chip $au.Cn)</td></tr>" }
+    # B: Craftnote "Auftrag terminiert", aber kein offener Sage-Auftrag dazu
+    $zugeordnet = @{}; foreach ($au in $liste) { if ($au.Cn) { $zugeordnet[$au.Cn.P.Id] = 1 } }
+    $letzte = @{}; foreach ($r in (Run-Query $SQL_LetzteAuftraege $null).Rows) { $letzte[[string]$r['Kto']] = $r }
+    $b = @($cn.Projekte | Where-Object { -not $_.Archiviert -and $_.Status -match 'Auftrag vorhanden' -and -not $zugeordnet.ContainsKey($_.Id) } | Sort-Object { - $(if ($_.Geaendert) { $_.Geaendert.Ticks } else { 0 }) })
+    $rowsB = foreach ($p in $b) {
+        $kto = $null; foreach ($m in $p.Mails) { if ($cn.MailKto.ContainsKey($m)) { $kto = $cn.MailKto[$m]; break } }
+        $sage = if (-not $kto) { "<span class='leise'>kein Sage-Kunde mit dieser E-Mail</span>" }
+                elseif (-not $letzte.ContainsKey($kto)) { "<span class='leise'>Kunde vorhanden, kein Auftrag</span>" }
+                else { $l = $letzte[$kto]; "letzter Auftrag $(HtmlEncode $l['Beleg']) vom $(([datetime]$l['Belegdatum']).ToString('dd.MM.yyyy'))$(if ([int]$l['Erledigt'] -eq 1) { ' &middot; <b>erledigt</b>' } else { ' &middot; offen' })" }
+        "<tr><td><a class='artlink' href='$CraftnoteWeb$($p.Id)' target='_blank'>$(HtmlEncode $p.Name) &#8599;</a></td><td>$(HtmlEncode "$($p.Plz) $($p.Ort)")</td><td>$(if ($p.Geaendert) { $p.Geaendert.ToString('dd.MM.yyyy') })</td><td>$sage</td></tr>"
+    }
+    # C: offene Sage-Auftraege ohne Craftnote-Projekt
+    $c = @($liste | Where-Object { -not $_.Cn })
+    $rowsC = foreach ($au in $c) { "<tr><td style='white-space:nowrap'>$(& $auZelle $au)</td><td>$(HtmlEncode $au.Kunde)</td><td>$(HtmlEncode $au.Baustelle)</td><td style='white-space:nowrap'>$(& $planZelle $au)</td></tr>" }
+    $unsicher = @($liste | Where-Object { $_.Cn -and -not $_.Cn.Sicher }).Count
+    $tab = { param($kopf, $rows, $leer) if (@($rows).Count) { "<table><thead><tr>$kopf</tr></thead><tbody>$($rows -join '')</tbody></table>" } else { "<p class='leise'>$leer</p>" } }
+    return @"
+$head
+<div class='kopf'><h1>Abgleich Craftnote</h1><div class='meta'>$(StandText) &middot; $($liste.Count) offene Auftr&auml;ge, $(@($liste | Where-Object { $_.Cn }).Count) zugeordnet$(if ($unsicher) { ", davon $unsicher unsicher" })</div></div>
+$(if ($script:CnFehler) { "<div class='hinweisbox'>$($script:CnFehler)</div>" })
+<h2>In Sage offen, in Craftnote abgeschlossen, abgesagt oder noch im Angebot ($($a.Count))</h2>
+$(& $tab "<th>Auftrag</th><th>Kunde</th><th>Montage</th><th>Geliefert</th><th>Berechnet</th><th>Craftnote</th>" $rowsA 'Keine Abweichungen.')
+<h2>In Craftnote &bdquo;Auftrag terminiert&ldquo;, in Sage kein offener Auftrag ($($b.Count))</h2>
+$(& $tab "<th>Craftnote-Projekt</th><th>Ort</th><th>Ge&auml;ndert</th><th>Sage</th>" $rowsB 'Keine Abweichungen.')
+<h2>Offene Auftr&auml;ge ohne Craftnote-Projekt ($($c.Count))</h2>
+$(& $tab "<th>Auftrag</th><th>Kunde</th><th>Baustelle</th><th>Montage</th>" $rowsC 'Alle offenen Auftr&auml;ge haben ein Craftnote-Projekt.')
+</body></html>
+"@
+}
+
 # ---------- Dienst ----------
 if ($MyInvocation.InvocationName -eq '.') { return }   # dot-gesourct (Test): nur Funktionen laden
 
@@ -3139,12 +3418,13 @@ while ($listener.IsListening) {
         $pfad = $request.Url.AbsolutePath.ToLower(); $query = $request.Url.Query
         $ausgabe = ""; $contentType = "text/html; charset=utf-8"; $bereitsGesendet = $false
         if ($pfad -eq "/") {
-            try { $ausgabe = Build-Auftraege (Get-Auftraege) $null }
+            try { $liste = @(Get-Auftraege); try { $null = Craftnote-Zuordnen $liste } catch { $script:CnFehler = HtmlEncode $_.Exception.Message }; $ausgabe = Build-Auftraege $liste $null }
             catch { $ausgabe = Build-Auftraege @() ($_.Exception.ToString()) }
         } elseif ($pfad -eq "/auftrag") {
             $bel = ([string](Parse-Query $query "bel")) -replace '[^0-9]', ''
             try {
                 $au = @(Get-Auftraege) | Where-Object { $_.BelID -eq $bel } | Select-Object -First 1
+                if ($au) { try { $null = Craftnote-Zuordnen @($au) } catch { $script:CnFehler = HtmlEncode $_.Exception.Message } }
                 $ausgabe = Build-AuftragDetail $au $(if ($au) { Get-AuftragPositionen $au }) $null
             } catch { $ausgabe = Build-AuftragDetail $null $null ($_.Exception.ToString()) }
         } elseif ($pfad -eq "/material") {
@@ -3357,6 +3637,22 @@ ORDER BY Lagerkennung, ISNULL(Dimension1, 0), ISNULL(Dimension2, 0), ISNULL(Dime
                 $null = Get-Auftraege
                 $ausgabe = Build-EkDetail (Run-Query $SQL_EkBeleg @{ "@bel" = [int]$bel }) $script:EkPositionen $null
             } catch { $ausgabe = Build-EkDetail $null @() ($_.Exception.ToString()) }
+        } elseif ($pfad -eq "/abgleich") {
+            try { $liste = @(Get-Auftraege); $cn = Craftnote-Zuordnen $liste; $ausgabe = Build-Abgleich $liste $cn $null }
+            catch { $ausgabe = Build-Abgleich @() $null ($_.Exception.ToString()) }
+        } elseif ($pfad -eq "/cndatei") {
+            $fid = [string](Parse-Query $query "id")
+            $ziel = $null
+            if ($fid -match '^[0-9a-fA-F-]{36}$') {
+                try {
+                    $req = [System.Net.HttpWebRequest]::Create("$CraftnoteBasis/files/$fid`?download=true"); $req.AllowAutoRedirect = $false
+                    $req.Headers.Add('X-CN-API-KEY', ([string](Umgebung 'CRAFTNOTE_API_KEY')).Trim())
+                    try { $res = $req.GetResponse() } catch [System.Net.WebException] { $res = $_.Exception.Response }
+                    if ($res) { if ([int]$res.StatusCode -ge 300 -and [int]$res.StatusCode -lt 400) { $ziel = $res.Headers['Location'] }; $res.Close() }
+                } catch {}
+            }
+            if ($ziel -and $ziel -match '^https://') { $response.Redirect($ziel); $response.Close(); $bereitsGesendet = $true }
+            else { $response.StatusCode = 404; $ausgabe = "Datei nicht gefunden" }
         } elseif ($pfad -eq "/datei") {
             # Datei aus der Sage-Sammelmappe ausliefern - nur Pfade, die in KHKSammelmappen stehen
             $dId = 0; [void][int]::TryParse(((Parse-Query $query "id") -replace '[^0-9]', ''), [ref]$dId)
