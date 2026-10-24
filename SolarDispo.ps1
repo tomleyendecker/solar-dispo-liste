@@ -399,6 +399,21 @@ a.cn-inbetrieb, a.cn-fertig { background:#d6f0dc; color:#1b5e20; }
 a.cn-absage { background:#fdecea; color:#b71c1c; }
 a.cn-service { background:#f3e5f5; color:#6a1b9a; }
 details summary { cursor:pointer; }
+.cnbilder { display:flex; flex-wrap:wrap; gap:8px; margin:4px 0 8px; }
+.cnbilder img { width:150px; height:112px; object-fit:cover; border-radius:6px; border:1px solid #e1e4e8; background:#F8F9FA; display:block; }
+.cnbilder a:hover img { border-color:#FFBC00; }
+.lb { position:fixed; left:0; top:0; right:0; bottom:0; z-index:2000; background:rgba(20,22,25,.93); display:flex; align-items:center; justify-content:center; overflow:hidden; }
+.lb[hidden] { display:none; }
+.lb img { user-select:none; will-change:transform; max-width:calc(100vw - 140px); max-height:calc(100vh - 110px); object-fit:contain; border-radius:4px; box-shadow:0 8px 30px rgba(0,0,0,.5); background:#2a2d31; }
+.lb-pf { z-index:2; position:absolute; top:50%; transform:translateY(-50%); width:52px; height:72px; border:none; border-radius:8px; background:rgba(20,22,25,.55); color:#fff; font-size:44px; line-height:1; cursor:pointer; }
+.lb-pf:hover { background:#FFBC00; color:#343A40; }
+.lb-l { left:16px; } .lb-r { right:16px; }
+.lb-zu { z-index:2; position:absolute; top:12px; right:16px; width:44px; height:44px; border:none; border-radius:50%; background:rgba(20,22,25,.55); color:#fff; font-size:28px; cursor:pointer; }
+.lb-zu:hover { background:#FFBC00; color:#343A40; }
+.lb-fuss { z-index:2; position:absolute; left:0; right:0; bottom:0; padding:12px 20px; display:flex; gap:16px; align-items:center; color:#dfe3e7; font-size:14px; background:linear-gradient(transparent, rgba(0,0,0,.55)); }
+.lb-fuss #lbnr { font-weight:700; color:#FFBC00; white-space:nowrap; }
+.lb-fuss #lbtxt { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.lb-fuss .btn { background:#FFBC00; color:#343A40; border-color:#FFBC00; }
 </style>
 </head>
 <body>
@@ -3138,6 +3153,11 @@ $CraftnoteBasis = 'https://functions.craftnote.cloud/api/v1'
 $CraftnoteWeb = 'https://app.mycraftnote.de/#/project?id='
 $CraftnoteCacheMinuten = 15
 $CraftnoteEigeneMails = '(?i)@(leyendecker\.solar|lorenz-ms\.de)$'   # eigene Mitarbeiter als Projektkontakt - nicht zuordnen
+# Ordner, die nie angezeigt/ausgeliefert werden (02 = Angebote und Planungen, enthaelt Preise)
+$CraftnoteGesperrteOrdner = '^\s*02\b'
+# Vorschaubilder der Fotos (einmal erzeugt, dann von der Platte)
+$CraftnoteVorschauPfad = Join-Path $PSScriptRoot 'craftnote-vorschau'
+$CraftnoteVorschauPixel = 320
 $SQL_KundenMails = @"
 SELECT kk.Kto, LOWER(LTRIM(RTRIM(ad.EMail))) AS Mail FROM KHKKontokorrent kk
 INNER JOIN KHKAdressen ad ON ad.Adresse = kk.Adresse AND ad.Mandant = kk.Mandant
@@ -3180,6 +3200,71 @@ function CN-Liste($pfad) {
     }
     return $erg.ToArray()
 }
+# Zeitlich begrenzter Download-Link einer Datei (Craftnote leitet auf den Speicher weiter); $null wenn nicht vorhanden
+# Bei vielen gleichzeitigen Abrufen antwortet Craftnote gelegentlich ohne Link - dann kurz warten und erneut versuchen.
+function CN-DownloadLink($fid, $versuche = 2, $pauseMs = 400) {
+    for ($v = 1; $v -le $versuche; $v++) {
+        $req = [System.Net.HttpWebRequest]::Create("$CraftnoteBasis/files/$fid`?download=true"); $req.AllowAutoRedirect = $false
+        $req.Headers.Add('X-CN-API-KEY', ([string](Umgebung 'CRAFTNOTE_API_KEY')).Trim())
+        try { $res = $req.GetResponse() } catch [System.Net.WebException] { $res = $_.Exception.Response } catch { $res = $null }
+        $ziel = $null
+        if ($res) { if ([int]$res.StatusCode -ge 300 -and [int]$res.StatusCode -lt 400) { $ziel = $res.Headers['Location'] }; $res.Close() }
+        if ($ziel -and $ziel -match '^https://') { return $ziel }
+        if ($v -lt $versuche) { Start-Sleep -Milliseconds ($pauseMs * $v) }
+    }
+    return $null
+}
+# Darf die Datei angezeigt werden? Nein, wenn sie (auch in Unterordnern) in einem gesperrten Ordner liegt.
+$script:CnErlaubt = @{}
+function CN-DateiErlaubt($fid) {
+    if ($script:CnErlaubt.ContainsKey($fid)) { return $script:CnErlaubt[$fid] }
+    $ok = $false
+    try {
+        $m = CN-Abruf "/files/$fid"
+        for ($i = 0; $i -lt 12 -and $m.folderId; $i++) { $m = CN-Abruf "/files/$($m.folderId)" }
+        $ok = -not ($m.type -eq 'FOLDER' -and [string]$m.name -match $CraftnoteGesperrteOrdner)
+    } catch { $ok = $false }
+    $script:CnErlaubt[$fid] = $ok
+    return $ok
+}
+# Vorschaubild erzeugen (laeuft im Hintergrund-Runspace): Original laden, nach EXIF drehen, verkleinern, als JPEG speichern
+function CN-VorschauErzeugen($fid, $datei) {
+    try {
+        Add-Type -AssemblyName System.Drawing
+        $url = CN-DownloadLink $fid 3 1500; if (-not $url) { return }   # voruebergehend: beim naechsten Aufruf erneut versuchen, nicht als Fehler merken
+        $wc = New-Object System.Net.WebClient; $bytes = $wc.DownloadData($url); $wc.Dispose()
+        $ms = New-Object System.IO.MemoryStream(, $bytes)
+        $img = [System.Drawing.Image]::FromStream($ms)
+        if ($img.PropertyIdList -contains 0x0112) {
+            switch ([int]$img.GetPropertyItem(0x0112).Value[0]) {
+                3 { $img.RotateFlip([System.Drawing.RotateFlipType]::Rotate180FlipNone) }
+                6 { $img.RotateFlip([System.Drawing.RotateFlipType]::Rotate90FlipNone) }
+                8 { $img.RotateFlip([System.Drawing.RotateFlipType]::Rotate270FlipNone) }
+            }
+        }
+        $fak = [math]::Min(1.0, $CraftnoteVorschauPixel / [math]::Max($img.Width, $img.Height))
+        $w = [math]::Max(1, [int]($img.Width * $fak)); $h = [math]::Max(1, [int]($img.Height * $fak))
+        $bmp = New-Object System.Drawing.Bitmap $w, $h
+        $g = [System.Drawing.Graphics]::FromImage($bmp); $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $g.DrawImage($img, 0, 0, $w, $h); $g.Dispose()
+        $enc = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' } | Select-Object -First 1
+        $par = New-Object System.Drawing.Imaging.EncoderParameters 1
+        $par.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]80)
+        $tmp = "$datei.tmp"; $bmp.Save($tmp, $enc, $par); $bmp.Dispose(); $img.Dispose(); $ms.Dispose()
+        Move-Item -LiteralPath $tmp -Destination $datei -Force
+    } catch { try { [System.IO.File]::WriteAllText("$datei.fehler", [string]$_.Exception.Message) } catch {} }
+}
+# Vorschau im Hintergrund anstossen (nicht doppelt), fertige Hintergrundjobs aufraeumen
+$script:VorschauJobs = New-Object System.Collections.ArrayList
+function CN-VorschauStarten($fid, $datei) {
+    foreach ($j in @($script:VorschauJobs)) { if ($j.H.IsCompleted) { try { [void]$j.PS.EndInvoke($j.H) } catch {}; $j.PS.Dispose(); $script:VorschauJobs.Remove($j) } }
+    if ($null -eq $ChatPool -or @($script:VorschauJobs | Where-Object { $_.Id -eq $fid }).Count -or $script:VorschauJobs.Count -ge 40) { return }
+    if (-not (Test-Path -LiteralPath $CraftnoteVorschauPfad)) { New-Item -ItemType Directory -Force -Path $CraftnoteVorschauPfad | Out-Null }
+    $ps = [powershell]::Create(); $ps.RunspacePool = $ChatPool
+    [void]$ps.AddScript('param($i, $d) CN-VorschauErzeugen $i $d').AddArgument($fid).AddArgument($datei)
+    [void]$script:VorschauJobs.Add(@{ Id = $fid; PS = $ps; H = $ps.BeginInvoke() })
+}
+
 function CN-Datum($u) {
     if (-not $u) { return $null }
     $v = [double]$u; if ($v -gt 1e11) { $v = $v / 1000 }
@@ -3312,21 +3397,96 @@ function CN-DetailHtml($z) {
         $dateien = @(CN-Liste "/projects/$($p.Id)/files")
         $ordner = @{}; foreach ($x in $dateien) { if ($x.type -eq 'FOLDER') { $ordner[[string]$x.id] = $x } }
         $oben = { param($fid) $n = 0; while ($fid -and $ordner.ContainsKey($fid) -and $ordner[$fid].folderId -and $n -lt 10) { $fid = [string]$ordner[$fid].folderId; $n++ }; $fid }
-        $gruppen = [ordered]@{}
+        $gruppen = [ordered]@{}; $anzBilder = 0
         foreach ($x in ($dateien | Where-Object { $_.type -ne 'FOLDER' } | Sort-Object { - [double]$_.creationTimestamp })) {
             $o = & $oben ([string]$x.folderId); $name = if ($o -and $ordner.ContainsKey($o)) { [string]$ordner[$o].name } else { 'ohne Ordner' }
+            # gesperrte Ordner (Angebote mit Preisen) gar nicht anzeigen und auch nicht ausliefern
+            if ($name -match $CraftnoteGesperrteOrdner) { $script:CnErlaubt[[string]$x.id] = $false; continue }
+            $script:CnErlaubt[[string]$x.id] = $true
             if (-not $gruppen.Contains($name)) { $gruppen[$name] = New-Object System.Collections.ArrayList }; [void]$gruppen[$name].Add($x)
         }
         if ($gruppen.Count) {
             $teile = foreach ($name in ($gruppen.Keys | Sort-Object)) {
-                $liste = @($gruppen[$name] | ForEach-Object { "<div><a class='artlink' href='/cndatei?id=$($_.id)' target='_blank'>$(HtmlEncode $_.name)</a> <span class='leise'>$(& $d (CN-Datum $_.creationTimestamp))</span></div>" })
-                "<details><summary>$(HtmlEncode $name) <span class='leise'>($($gruppen[$name].Count))</span></summary><div style='padding:4px 0 6px 16px'>$($liste -join '')</div></details>"
+                $bilder = @($gruppen[$name] | Where-Object { $_.type -eq 'IMAGE' })
+                $sonst = @($gruppen[$name] | Where-Object { $_.type -ne 'IMAGE' })
+                $anzBilder += $bilder.Count
+                $bHtml = if ($bilder.Count) { "<div class='cnbilder'>" + (($bilder | ForEach-Object {
+                    $info = "$(HtmlEncode $name) &middot; $(HtmlEncode $_.name) &middot; $(& $d (CN-Datum $_.creationTimestamp))"
+                    "<a class='cnbild' href='/cndatei?id=$($_.id)' target='_blank' data-id='$($_.id)' data-info='$info' title='$(HtmlEncode $_.name)'><img src='/cnvorschau?id=$($_.id)' loading='lazy' alt=''></a>" }) -join '') + "</div>" } else { "" }
+                $lHtml = ($sonst | ForEach-Object { "<div><a class='artlink' href='/cndatei?id=$($_.id)' target='_blank'>$(HtmlEncode $_.name)</a> <span class='leise'>$(& $d (CN-Datum $_.creationTimestamp))</span></div>" }) -join ''
+                "<details$(if ($bilder.Count) { ' open' })><summary>$(HtmlEncode $name) <span class='leise'>($($gruppen[$name].Count))</span></summary><div style='padding:4px 0 6px 16px'>$bHtml$lHtml</div></details>"
             }
             [void]$zeilen.Add("<tr><td>Dateien</td><td>$($teile -join '')</td></tr>")
         } else { [void]$zeilen.Add("<tr><td>Dateien</td><td class='leise'>keine</td></tr>") }
     } catch { [void]$zeilen.Add("<tr><td>Details</td><td class='leise'>Craftnote-Details nicht abrufbar: $(HtmlEncode $_.Exception.Message)</td></tr>") }
-    return "<table style='max-width:900px'><tbody>$($zeilen -join '')</tbody></table>"
+    return "<table style='max-width:900px'><tbody>$($zeilen -join '')</tbody></table>$(if ($anzBilder) { $CnBildbetrachter })"
 }
+
+# Bildbetrachter fuer die Craftnote-Fotos: Pfeiltasten / Wischen, Esc schliesst, Download nur ueber den Knopf.
+# Erst die Vorschau (sofort da), dann das Original nachladen. Nur ASCII (Umlaute als Entities / \u-Escapes).
+$CnBildbetrachter = @'
+<div id='lb' class='lb' hidden>
+  <button type='button' class='lb-zu' title='Schlie&szlig;en (Esc)'>&times;</button>
+  <button type='button' class='lb-pf lb-l' title='Vorheriges Foto (&larr;)'>&#8249;</button>
+  <img id='lbimg' alt='' draggable='false' title='Mausrad: zoomen &middot; Ziehen: verschieben &middot; Doppelklick: zoomen / ganze Ansicht'>
+  <button type='button' class='lb-pf lb-r' title='N&auml;chstes Foto (&rarr;)'>&#8250;</button>
+  <div class='lb-fuss'><span id='lbnr'></span><span id='lbtxt'></span><a id='lbdl' class='btn' href='#'>Download</a></div>
+</div>
+<script>
+(function () {
+  var bilder = Array.prototype.slice.call(document.querySelectorAll('a.cnbild'));
+  var lb = document.getElementById('lb'), img = document.getElementById('lbimg'), idx = 0, laden = null, tx = null;
+  if (!bilder.length || !lb) return;
+  function zeige(i) {
+    idx = (i + bilder.length) % bilder.length; reset();
+    var a = bilder[idx], id = a.getAttribute('data-id');
+    img.src = '/cnvorschau?id=' + id;                       // sofort die Vorschau
+    laden = new Image(); var diese = laden;
+    laden.onload = function () { if (diese === laden) img.src = diese.src; };
+    laden.src = '/cndatei?id=' + id;                        // dann das Original
+    document.getElementById('lbnr').textContent = (idx + 1) + ' / ' + bilder.length;
+    document.getElementById('lbtxt').innerHTML = a.getAttribute('data-info');
+    document.getElementById('lbdl').href = '/cndatei?id=' + id + '&download=1';
+    var n = bilder[(idx + 1) % bilder.length]; (new Image()).src = '/cnvorschau?id=' + n.getAttribute('data-id');
+  }
+  // Zoom per Mausrad (zum Mauszeiger hin), Verschieben per Ziehen, Doppelklick wechselt zwischen Zoom und ganzer Ansicht
+  var z = 1, px = 0, py = 0, zieh = null, gezogen = false;
+  img.style.transformOrigin = '0 0';
+  function setze() { img.style.transform = 'translate(' + px + 'px,' + py + 'px) scale(' + z + ')'; img.style.cursor = z > 1 ? (zieh ? 'grabbing' : 'grab') : 'zoom-in'; }
+  function reset() { z = 1; px = 0; py = 0; zieh = null; setze(); }
+  function zoomAuf(neu, mx, my) {
+    neu = Math.min(8, Math.max(1, neu));
+    if (neu === 1) { reset(); return; }
+    var r = img.getBoundingClientRect(), bx = r.left - px, by = r.top - py;
+    px = mx - bx - neu * (mx - bx - px) / z; py = my - by - neu * (my - by - py) / z; z = neu; setze();
+  }
+  lb.addEventListener('wheel', function (e) { if (lb.hidden) return; e.preventDefault(); zoomAuf(z * (e.deltaY < 0 ? 1.25 : 0.8), e.clientX, e.clientY); }, { passive: false });
+  img.addEventListener('dblclick', function (e) { e.preventDefault(); if (z > 1) reset(); else zoomAuf(2.5, e.clientX, e.clientY); });
+  img.addEventListener('mousedown', function (e) { if (z <= 1 || e.button !== 0) return; e.preventDefault(); zieh = { x: e.clientX - px, y: e.clientY - py }; gezogen = false; setze(); });
+  document.addEventListener('mousemove', function (e) { if (!zieh) return; px = e.clientX - zieh.x; py = e.clientY - zieh.y; gezogen = true; setze(); });
+  document.addEventListener('mouseup', function () { if (zieh) { zieh = null; setze(); } });
+  function auf(i) { lb.hidden = false; document.body.style.overflow = 'hidden'; zeige(i); }
+  function zu() { lb.hidden = true; document.body.style.overflow = ''; img.src = ''; laden = null; }
+  bilder.forEach(function (a, i) { a.addEventListener('click', function (e) { e.preventDefault(); auf(i); }); });
+  lb.querySelector('.lb-zu').onclick = zu;
+  lb.querySelector('.lb-l').onclick = function (e) { e.stopPropagation(); zeige(idx - 1); };
+  lb.querySelector('.lb-r').onclick = function (e) { e.stopPropagation(); zeige(idx + 1); };
+  lb.addEventListener('click', function (e) { if (e.target === lb && !gezogen) zu(); gezogen = false; });
+  document.addEventListener('keydown', function (e) {
+    if (lb.hidden) return;
+    if (e.key === 'ArrowLeft') { e.preventDefault(); zeige(idx - 1); }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); zeige(idx + 1); }
+    else if (e.key === 'Escape') { zu(); }
+  });
+  lb.addEventListener('touchstart', function (e) { tx = e.touches[0].clientX; }, { passive: true });
+  lb.addEventListener('touchend', function (e) {
+    if (tx === null) return; var dx = e.changedTouches[0].clientX - tx; tx = null;
+    if (z === 1 && Math.abs(dx) > 50) zeige(idx + (dx < 0 ? 1 : -1));
+  });
+})();
+</script>
+'@
+
 
 # ---------- Abgleich Sage <-> Craftnote ----------
 function Build-Abgleich($liste, $cn, $fehler) {
@@ -3640,18 +3800,34 @@ ORDER BY Lagerkennung, ISNULL(Dimension1, 0), ISNULL(Dimension2, 0), ISNULL(Dime
         } elseif ($pfad -eq "/abgleich") {
             try { $liste = @(Get-Auftraege); $cn = Craftnote-Zuordnen $liste; $ausgabe = Build-Abgleich $liste $cn $null }
             catch { $ausgabe = Build-Abgleich @() $null ($_.Exception.ToString()) }
-        } elseif ($pfad -eq "/cndatei") {
-            $fid = [string](Parse-Query $query "id")
-            $ziel = $null
-            if ($fid -match '^[0-9a-fA-F-]{36}$') {
-                try {
-                    $req = [System.Net.HttpWebRequest]::Create("$CraftnoteBasis/files/$fid`?download=true"); $req.AllowAutoRedirect = $false
-                    $req.Headers.Add('X-CN-API-KEY', ([string](Umgebung 'CRAFTNOTE_API_KEY')).Trim())
-                    try { $res = $req.GetResponse() } catch [System.Net.WebException] { $res = $_.Exception.Response }
-                    if ($res) { if ([int]$res.StatusCode -ge 300 -and [int]$res.StatusCode -lt 400) { $ziel = $res.Headers['Location'] }; $res.Close() }
-                } catch {}
+        } elseif ($pfad -eq "/cndatei" -or $pfad -eq "/cnvorschau") {
+            # Craftnote-Datei bzw. Vorschaubild - nie aus gesperrten Ordnern (Angebote mit Preisen)
+            $fid = [string](Parse-Query $query "id")   # Gross-/Kleinschreibung beibehalten - Craftnote unterscheidet (iPhone-Uploads: Grossbuchstaben)
+            $ziel = $null; $vorschau = $null
+            if ($fid -match '^[0-9a-fA-F-]{36}$' -and (CN-DateiErlaubt $fid)) {
+                if ($pfad -eq "/cnvorschau") {
+                    $vDatei = Join-Path $CraftnoteVorschauPfad "$fid.jpg"
+                    if (Test-Path -LiteralPath $vDatei) { $vorschau = $vDatei }
+                    elseif (-not (Test-Path -LiteralPath "$vDatei.fehler")) { CN-VorschauStarten $fid $vDatei }   # diesmal noch das Original
+                }
+                if (-not $vorschau) { try { $ziel = CN-DownloadLink $fid } catch {} }
             }
-            if ($ziel -and $ziel -match '^https://') { $response.Redirect($ziel); $response.Close(); $bereitsGesendet = $true }
+            if ($vorschau) {
+                $bytes = [System.IO.File]::ReadAllBytes($vorschau)
+                $response.ContentType = 'image/jpeg'; $response.AddHeader("Cache-Control", "private, max-age=86400")
+                $response.ContentLength64 = $bytes.Length; $response.OutputStream.Write($bytes, 0, $bytes.Length); $response.OutputStream.Close()
+                $bereitsGesendet = $true
+            } elseif ($ziel -and $pfad -eq "/cndatei" -and (Parse-Query $query "download") -eq '1') {
+                try {
+                    $meta = CN-Abruf "/files/$fid"; $dName = ([string]$meta.name).Trim(); if (-not $dName) { $dName = "$fid" }
+                    if ([double]$meta.size -gt $DokuMaxMB * 1MB) { throw "zu gross" }
+                    $wc = New-Object System.Net.WebClient; $bytes = $wc.DownloadData($ziel); $wc.Dispose()
+                    $response.ContentType = (Get-DateiTyp $dName).Mime
+                    $response.AddHeader("Content-Disposition", "attachment; filename*=UTF-8''$([System.Uri]::EscapeDataString($dName))")
+                    $response.ContentLength64 = $bytes.Length; $response.OutputStream.Write($bytes, 0, $bytes.Length); $response.OutputStream.Close()
+                } catch { $response.Redirect($ziel); $response.Close() }
+                $bereitsGesendet = $true
+            } elseif ($ziel) { $response.Redirect($ziel); $response.Close(); $bereitsGesendet = $true }
             else { $response.StatusCode = 404; $ausgabe = "Datei nicht gefunden" }
         } elseif ($pfad -eq "/datei") {
             # Datei aus der Sage-Sammelmappe ausliefern - nur Pfade, die in KHKSammelmappen stehen

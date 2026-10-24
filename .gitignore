@@ -12,3 +12,6 @@ secrets.local.ps1
 # Assistent: Fragen und Bewertungen der Nutzer
 chat-protokoll.jsonl
 chat-bewertungen.jsonl
+
+# Vorschaubilder der Craftnote-Fotos (Cache)
+craftnote-vorschau/
