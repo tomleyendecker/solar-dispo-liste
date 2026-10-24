@@ -78,7 +78,7 @@ function Stop-VerwaisteDienste {
 
 function Start-Dienst {
     Stop-VerwaisteDienste
-    Log "Starte Oezerliste-Dienst ..."
+    Log "Starte Solar-Dienst ..."
     $script:proc = Start-Process powershell.exe `
         -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPfad`"" `
         -PassThru -NoNewWindow `
@@ -88,7 +88,7 @@ function Start-Dienst {
 
 function Stop-Dienst {
     if ($proc -and -not $proc.HasExited) {
-        Log "Stoppe Oezerliste-Dienst (PID $($proc.Id)) ..."
+        Log "Stoppe Solar-Dienst (PID $($proc.Id)) ..."
         Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
         try { $proc.WaitForExit(10000) | Out-Null } catch { }
     }

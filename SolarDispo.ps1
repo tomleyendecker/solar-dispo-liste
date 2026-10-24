@@ -63,7 +63,9 @@ function Parse-Query($rawQuery, $name) {
 $WochentagKurz = @('So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa')
 function Datum-Kurz($d) { if ($d -isnot [datetime]) { return "" }; return "$($WochentagKurz[[int]$d.DayOfWeek]) $($d.ToString('dd.MM.'))" }
 # Vergleichsform fuer Namen: klein, Umlaute ausgeschrieben
-function Name-Norm($s) { return (([string]$s).ToLower() -replace [char]0x00e4, 'ae' -replace [char]0x00f6, 'oe' -replace [char]0x00fc, 'ue' -replace [char]0x00df, 'ss') }
+function Name-Norm($s) { return (Name-Umlaut $s).ToLower() }
+# Umlaute ausschreiben, Gross-/Kleinschreibung behalten (fuer die Vornamen-Pruefung)
+function Name-Umlaut($s) { return ([string]$s -creplace [char]0x00e4, 'ae' -creplace [char]0x00f6, 'oe' -creplace [char]0x00fc, 'ue' -creplace [char]0x00c4, 'Ae' -creplace [char]0x00d6, 'Oe' -creplace [char]0x00dc, 'Ue' -replace [char]0x00df, 'ss') }
 
 # ---------- Montagetermine aus dem Online-Kalender (iCal) ----------
 # Termine: Titel = Kundenname + Zusatz ("Juchem, Wilhelm (29 kWp ...)"), Kategorie = Monteur/Team.
@@ -96,7 +98,7 @@ function Get-Kalender {
             if (-not $ende) { $ende = $start }
             if ($ganztag -and $ende -gt $start) { $ende = $ende.AddDays(-1) }     # DTEND ist bei ganztaegigen Terminen exklusiv
             $titel = Ical-Text (& $feld 'SUMMARY')
-            $liste.Add([pscustomobject]@{ Start = $start; Ende = $ende; Ganztag = $ganztag; Titel = $titel; Norm = (Name-Norm $titel)
+            $liste.Add([pscustomobject]@{ Start = $start; Ende = $ende; Ganztag = $ganztag; Titel = $titel; Norm = (Name-Norm $titel); Fall = (Name-Umlaut $titel)
                                          Team = (($kat -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }); Ort = (Ical-Text (& $feld 'LOCATION')) })
         }
         $script:KalCache = $liste.ToArray(); $script:KalZeit = Get-Date; $script:KalFehler = ""
@@ -108,7 +110,7 @@ function Get-Kalender {
     return $script:KalCache
 }
 
-# Termine zu einem Kunden: Nachname muss im Titel stehen. Steht dort "Nachname, Vorname" mit einem anderen
+# Termine zu einem Kunden: Nachname (letztes Wort, bei 'Nachname, Vorname' das erste) muss im Titel stehen. Steht dort "Nachname, Vorname" mit einem anderen grossgeschriebenen
 # Vornamen, ist es eine andere Person. Sicher = auch der Vorname steht im Titel (oder Firma).
 $FirmenMuster = '(?i)gmbh|gbr|\bkg\b|\bag\b|e\.v\.|stiftung|verwaltung|beteiligung|\bohg\b|\bug\b'
 $NamenStopp = @('gmbh', 'und', 'co', 'kg', 'gbr', 'grundstuecks', 'beteiligungs', 'verwaltungs', 'energie', 'solar', 'herr', 'frau', 'familie', 'eheleute')
@@ -116,20 +118,34 @@ function Kunden-Termine($name, $termine) {
     $woerter = @(((Name-Norm $name) -split '[^a-z]+') | Where-Object { $_.Length -ge 3 -and $NamenStopp -notcontains $_ })
     if ($woerter.Count -eq 0) { return @() }
     $firma = ([string]$name -match $FirmenMuster)
-    $vorname = if (-not $firma -and $woerter.Count -ge 2) { $woerter[0] } else { $null }
-    $nach = if ($vorname) { $woerter[1..($woerter.Count - 1)] } else { $woerter }
+    # Person: Nachname = letztes Wort ("Jenny und Julian Alloway" -> alloway), bei "Nachname, Vorname" das erste
+    $vorname = $null; $nach = $woerter
+    if (-not $firma -and $woerter.Count -ge 2) {
+        if ([string]$name -match ',') { $nach = @($woerter[0]); $vorname = $woerter[1] }
+        else { $nach = @($woerter[-1]); $vorname = $woerter[0] }
+    }
     $erg = foreach ($t in $termine) {
         $passt = $false
         foreach ($n in $nach) {
             if ($t.Norm -match "\b$n\b") {
                 $passt = $true
-                if ($vorname -and $t.Norm -match "\b$n,\s*([a-z]+)" -and $matches[1] -ne $vorname) { $passt = $false }
+                # "Nachname, Vorname" mit anderem, grossgeschriebenem Vornamen = andere Person ("Schmitz, Bodo");
+                # kleingeschrieben ist es Text ("Halama, nach Dachsanierung")
+                if ($vorname -and $t.Fall -match "(?i)\b$n,\s*([A-Za-z]+)" -and [char]::IsUpper($matches[1][0]) -and $matches[1].ToLower() -ne $vorname) { $passt = $false }
             }
         }
         if ($passt) { [pscustomobject]@{ T = $t; Sicher = ($firma -or ($vorname -and $t.Norm -match "\b$vorname\b")) } }
     }
     return @($erg)
 }
+
+# Modulleistung in Watt aus der Bezeichnung einer Modulposition (Artikelgruppe 50), z.B. "LUXOR Eco Line M108 465W"
+function Modul-Wp($gruppe, $bez) {
+    if ([string]$gruppe -ne '50') { return $null }
+    if ([string]$bez -match '(\d{3})\s*Wp?\b') { return [int]$matches[1] }
+    return $null
+}
+function Fmt-kWp($k) { if (-not $k) { return "" }; return ([math]::Round($k, 1)).ToString('0.#', [Globalization.CultureInfo]'de-DE') + " kWp" }
 
 # ---------- Offene Auftraege (AB, Reservierungsbestaetigung, AB aus Reservierung) ----------
 # Offen-Logik wie bei Lorenz: Vorgang und Vorgangsposition nicht erfuellt, Restmenge > 0.
@@ -175,6 +191,11 @@ function Get-Auftraege {
         $a = [string]$r["Artikelnummer"]; if (-not $ek.ContainsKey($a)) { $ek[$a] = New-Object System.Collections.ArrayList }
         [void]$ek[$a].Add(@{ Rest = [double](ToNum $r["Offen"]); Termin = $r["Liefertermin"] })
     }
+    $script:Bestand = $bestand; $script:EkSumme = @{}; $script:EkTermin = @{}
+    foreach ($a in $ek.Keys) {
+        $script:EkSumme[$a] = ($ek[$a] | ForEach-Object { $_.Rest } | Measure-Object -Sum).Sum
+        $t = @($ek[$a] | ForEach-Object { $_.Termin } | Where-Object { $_ -is [datetime] } | Sort-Object); if ($t.Count) { $script:EkTermin[$a] = $t[0] }
+    }
 
     $auftraege = [ordered]@{}
     foreach ($r in $pos.Rows) {
@@ -187,7 +208,7 @@ function Get-Auftraege {
             $kunde = (@(([string]$r["A0Name1"]).Trim(), ([string]$r["A0Name2"]).Trim()) | Where-Object { $_ }) -join ' '
             $auftraege[$id] = @{ BelID = $id; Beleg = [string]$r["Beleg"]; Art = $art; Datum = $r["Belegdatum"]; Kunde = $kunde; Name1 = [string]$r["A0Name1"]
                                  Baustelle = (@($bsStr, $bsOrt) | Where-Object { $_ }) -join ', '; BaustelleName = $bsName
-                                 Liefertermin = $null; Material = (New-Object System.Collections.ArrayList); Leistungen = (New-Object System.Collections.ArrayList) }
+                                 Liefertermin = $null; kWp = 0.0; Material = (New-Object System.Collections.ArrayList); Leistungen = (New-Object System.Collections.ArrayList) }
         }
         $au = $auftraege[$id]
         $lt = $r["Liefertermin"]; if ($lt -is [datetime] -and ($null -eq $au.Liefertermin -or $lt -lt $au.Liefertermin)) { $au.Liefertermin = $lt }
@@ -197,6 +218,7 @@ function Get-Auftraege {
             [void]$au.Leistungen.Add(@{ Art = $an; Bez = $bez; Menge = $menge }); continue
         }
         $gName = if ($MaterialGruppen.Contains($gr)) { $MaterialGruppen[$gr] } else { 'Sonstiges' }
+        $wp = Modul-Wp $gr $bez; if ($wp) { $au.kWp += $menge * $wp / 1000 }
         if ($stl.ContainsKey($an)) {
             # Handelsstueckliste (z.B. Speicher): die lagergefuehrten Bestandteile pruefen
             foreach ($k in $stl[$an]) {
@@ -289,6 +311,8 @@ a.artlink:hover { text-decoration:underline; }
 <body>
 <nav class='hauptnav'><a class='marke' href='/'>Solar Dispo</a>
   <a class='nav$(if ($pfad -eq '/' -or $pfad -eq '/auftrag') { ' aktiv' })' href='/'>Offene Auftr&auml;ge</a>
+  <a class='nav$(if ($pfad -eq '/material') { ' aktiv' })' href='/material'>Materialbedarf</a>
+  <a class='nav$(if ($pfad -eq '/angebote') { ' aktiv' })' href='/angebote'>Angebote</a>
 </nav>
 "@
 }
@@ -328,11 +352,11 @@ function Build-Auftraege($liste, $fehler) {
             $lt = if ($au.Liefertermin) { $au.Liefertermin.ToString('dd.MM.yyyy') } else { "" }
             "<tr><td style='white-space:nowrap'>$montage</td>" +
             "<td style='white-space:nowrap'><span class='$artCls'>$($au.Art)</span> <a class='artlink' href='/auftrag?bel=$($au.BelID)'>$(HtmlEncode $au.Beleg)</a></td>" +
-            "<td>$(HtmlEncode $au.Kunde)</td><td>$(HtmlEncode $au.Baustelle)</td><td style='white-space:nowrap'>$lt</td><td>$($chips -join '')</td></tr>"
+            "<td>$(HtmlEncode $au.Kunde)</td><td>$(HtmlEncode $au.Baustelle)</td><td class='num' style='white-space:nowrap'>$(Fmt-kWp $au.kWp)</td><td style='white-space:nowrap'>$lt</td><td>$($chips -join '')</td></tr>"
         }
         $inhalt = @"
 <table id='tab'>
-<thead><tr><th>Montage</th><th>Auftrag</th><th>Kunde</th><th>Baustelle</th><th>Liefertermin</th><th>Material</th></tr></thead>
+<thead><tr><th>Montage</th><th>Auftrag</th><th>Kunde</th><th>Baustelle</th><th class='num'>Anlage</th><th>Liefertermin</th><th>Material</th></tr></thead>
 <tbody>$($rows -join '')</tbody>
 </table>
 "@
@@ -391,6 +415,7 @@ $head
 <tr><td>Baustelle</td><td>$(HtmlEncode (@($au.BaustelleName, $au.Baustelle) | Where-Object { $_ }) -join ', ')</td></tr>
 <tr><td>Auftragsdatum</td><td>$(if ($au.Datum -is [datetime]) { $au.Datum.ToString('dd.MM.yyyy') })</td></tr>
 <tr><td>Liefertermin</td><td>$(if ($au.Liefertermin) { $au.Liefertermin.ToString('dd.MM.yyyy') })</td></tr>
+<tr><td>Anlage</td><td>$(Fmt-kWp $au.kWp)</td></tr>
 </tbody></table>
 <h2>Montagetermine</h2>
 $termine
@@ -401,6 +426,161 @@ $leistungen
 </body></html>
 "@
 }
+
+# ---------- Materialbedarf (Lager / Einkauf) ----------
+# Je Lagerartikel: Bedarf aus allen offenen Auftraegen, Bestand, offene Bestellungen und der erste Termin, an dem
+# es fehlt. Gleiche Zuteilung wie auf "Offene Auftraege" (Auftraege nach Montage-/Liefertermin). Dazu die Positionen
+# ohne Lagerfuehrung (z.B. Montagesystem LORENZ, Sonderteile), die je Auftrag beschafft werden muessen.
+function Build-Material($liste, $nur, $tage, $fehler) {
+    $head = Page-Head "Solar Dispo - Materialbedarf"
+    $heute = (Get-Date).Date
+    $bis = if ($tage -gt 0) { $heute.AddDays($tage) } else { [datetime]::MaxValue }
+    $inhalt = ""
+    if ($fehler) { $inhalt = "<div class='fehler'>Fehler beim Laden der Daten:<br><pre>$(HtmlEncode $fehler)</pre></div>" }
+    else {
+        $art = [ordered]@{}; $ohneLager = New-Object System.Collections.ArrayList
+        foreach ($au in $liste) {
+            if ($au.Planung -gt $bis) { continue }
+            foreach ($m in $au.Material) {
+                if (-not $m.Lager) {
+                    if ($m.Gruppe -ne 'Elektro') { [void]$ohneLager.Add(@{ Au = $au; M = $m }) }
+                    continue
+                }
+                if (-not $art.Contains($m.Art)) { $art[$m.Art] = @{ Art = $m.Art; Bez = $m.Bez; Gruppe = $m.Gruppe; Bedarf = 0.0; Fehl = 0.0; Bestellt = $false; Erster = $null; ErsterAu = $null; Zeilen = (New-Object System.Collections.ArrayList) } }
+                $a = $art[$m.Art]; $a.Bedarf += $m.Menge
+                if ($m.Status -eq 'fehlt') { $a.Fehl += $m.Fehl; if (-not $a.Erster) { $a.Erster = $au.Planung; $a.ErsterAu = $au } }
+                if ($m.Status -eq 'bestellt') { $a.Bestellt = $true }
+                [void]$a.Zeilen.Add(@{ Au = $au; M = $m })
+            }
+        }
+        $alle = @($art.Values)
+        $anzFehlt = @($alle | Where-Object { $_.Fehl -gt 0 }).Count
+        $zeige = if ($nur -eq 'alle') { $alle } else { @($alle | Where-Object { $_.Fehl -gt 0 }) }
+        $zeige = @($zeige | Sort-Object { if ($_.Fehl -gt 0) { 0 } elseif ($_.Bestellt) { 1 } else { 2 } }, { if ($_.Erster) { $_.Erster } else { [datetime]::MaxValue } }, { $_.Gruppe }, { $_.Art })
+        $rows = foreach ($a in $zeige) {
+            $st = if ($a.Fehl -gt 0) { "<span class='chip fehlt'>fehlt $(FmtZahl $a.Fehl)</span>" } elseif ($a.Bestellt) { "<span class='chip bestellt'>bestellt</span>" } else { "<span class='chip da'>da</span>" }
+            $best = ToNum $script:Bestand[$a.Art]; if ($null -eq $best) { $best = 0 }
+            $ekM = ToNum $script:EkSumme[$a.Art]
+            $ekTxt = if ($ekM) { "$(FmtZahl $ekM)$(if ($script:EkTermin[$a.Art]) { " <span class='leise'>ab $($script:EkTermin[$a.Art].ToString('dd.MM.'))</span>" })" } else { "<span class='leise'>&ndash;</span>" }
+            $erster = if ($a.ErsterAu) { "$(Datum-Kurz $a.Erster) &middot; <a class='artlink' href='/auftrag?bel=$($a.ErsterAu.BelID)'>$(HtmlEncode $a.ErsterAu.Kunde)</a>" } else { "" }
+            $tip = HtmlEncode ((@($a.Zeilen | ForEach-Object {
+                $d = if ($_.Au.Planung -ne [datetime]::MaxValue) { $_.Au.Planung.ToString('dd.MM.') } else { 'ohne Termin' }
+                "$d  $($_.Au.Beleg)  $($_.Au.Kunde): $(FmtZahl $_.M.Menge)$(if ($_.M.Status -eq 'fehlt') { ' (fehlt ' + (FmtZahl $_.M.Fehl) + ')' })"
+            })) -join "`n")
+            "<tr><td>$st</td><td>$($a.Gruppe)</td><td>$(HtmlEncode $a.Art)</td><td>$(HtmlEncode $a.Bez)</td>" +
+            "<td class='num'>$(FmtZahl $a.Bedarf)</td><td class='num'>$(FmtZahl $best)</td><td class='num' style='white-space:nowrap'>$ekTxt</td>" +
+            "<td style='white-space:nowrap'>$erster</td><td class='num' title='$tip' style='cursor:help'>$($a.Zeilen.Count)</td></tr>"
+        }
+        $tab1 = if ($zeige.Count) {
+            "<table class='filtertab'><thead><tr><th>Status</th><th>Gruppe</th><th>Artikel</th><th>Bezeichnung</th><th class='num'>Bedarf</th><th class='num'>Bestand</th><th class='num'>bestellt</th><th>fehlt ab</th><th class='num' title='Anzahl Auftr&auml;ge; Maus dar&uuml;ber zeigt sie'>Auftr.</th></tr></thead><tbody>$($rows -join '')</tbody></table>"
+        } else { "<p class='leise'>Nichts fehlt in diesem Zeitraum.</p>" }
+        # Positionen ohne Lagerfuehrung je Auftrag
+        $rows2 = foreach ($x in ($ohneLager | Sort-Object { $_.Au.Planung }, { $_.Au.BelID })) {
+            $d = if ($x.Au.Planung -ne [datetime]::MaxValue) { Datum-Kurz $x.Au.Planung } else { "<span class='leise'>ohne Termin</span>" }
+            "<tr><td style='white-space:nowrap'>$d</td><td><a class='artlink' href='/auftrag?bel=$($x.Au.BelID)'>$(HtmlEncode $x.Au.Beleg)</a></td><td>$(HtmlEncode $x.Au.Kunde)</td>" +
+            "<td>$($x.M.Gruppe)</td><td>$(HtmlEncode $x.M.Art)</td><td>$(HtmlEncode $x.M.Bez)</td><td class='num'>$(FmtZahl $x.M.Menge)</td></tr>"
+        }
+        $tab2 = if ($ohneLager.Count) {
+            "<h2>Ohne Lagerf&uuml;hrung &ndash; je Auftrag zu beschaffen</h2><table class='filtertab'><thead><tr><th>Termin</th><th>Auftrag</th><th>Kunde</th><th>Gruppe</th><th>Artikel</th><th>Bezeichnung</th><th class='num'>Menge</th></tr></thead><tbody>$($rows2 -join '')</tbody></table>"
+        } else { "" }
+        $inhalt = "$tab1`n$tab2"
+    }
+    $knopf = { param($n, $t, $text) $cls = if ($n -eq $nur -and $t -eq $tage) { 'btn' } else { 'btn btn2' }; "<a class='$cls' href='/material?nur=$n&amp;tage=$t'>$text</a>" }
+    $zeitKnoepfe = (@(@(14, '2 Wochen'), @(28, '4 Wochen'), @(0, 'Alle Termine')) | ForEach-Object { & $knopf $nur $_[0] $_[1] }) -join ' '
+    $nurKnoepfe = (& $knopf 'fehlt' $tage "Nur Fehlendes ($anzFehlt)") + ' ' + (& $knopf 'alle' $tage 'Alle Artikel')
+    return @"
+$head
+<div class='kopf'><h1>Materialbedarf</h1><div class='meta'>$(StandText)</div></div>
+<div class='steuer'>$zeitKnoepfe <span style='width:12px'></span> $nurKnoepfe <input class='suche' id='suche' placeholder='Filtern ...' onkeyup='filter()'></div>
+$(if ($script:KalFehler) { "<div class='hinweisbox'>$(HtmlEncode $script:KalFehler)</div>" })
+$inhalt
+<script>
+function filter(){
+  var q=document.getElementById('suche').value.toLowerCase();
+  document.querySelectorAll('.filtertab tbody tr').forEach(function(tr){ tr.style.display = tr.innerText.toLowerCase().indexOf(q)>-1 ? '' : 'none'; });
+}
+</script>
+</body></html>
+"@
+}
+
+# ---------- Offene Angebote (Projektleitung) ----------
+# In dieser Datenbank bekommt ein Angebot erst mit der Beauftragung einen Vorgang: offen = VorID 0.
+# Hat der Kunde danach einen Auftrag (z.B. ueber eine andere Angebotsvariante), wird das Angebot ausgegraut.
+$SQL_OffeneAngebote = @"
+SELECT k.BelID, CAST(k.Belegjahr AS varchar) + '-' + CAST(k.Belegnummer AS varchar) AS Beleg, k.Belegdatum,
+       k.A0Name1, k.A0Name2, k.A0Ort, k.A1Ort, k.A1Strasse,
+       p.Artikelnummer, p.Bezeichnung1 AS PosBezeichnung, p.Menge, a.Artikelgruppe, a.Stuecklistentyp,
+       ab.Beleg AS AuftragDanach
+FROM KHKVKBelege k
+LEFT JOIN KHKVKBelegePositionen p ON p.BelID = k.BelID AND p.Mandant = k.Mandant AND p.PosType = 1
+LEFT JOIN KHKArtikel a ON a.Artikelnummer = p.Artikelnummer AND a.Mandant = p.Mandant
+OUTER APPLY (SELECT TOP 1 CAST(x.Belegjahr AS varchar) + '-' + CAST(x.Belegnummer AS varchar) AS Beleg FROM KHKVKBelege x
+             WHERE x.Mandant = k.Mandant AND x.A0Empfaenger = k.A0Empfaenger AND x.Belegdatum >= k.Belegdatum
+               AND (x.Belegart LIKE 'Auftragsbest%' OR x.Belegart LIKE 'Reservierungsbest%') ORDER BY x.Belegdatum) ab
+WHERE k.Mandant = $Mandant AND k.Belegart = 'Angebot' AND k.VorID = 0 AND k.Belegdatum >= @von
+ORDER BY k.Belegdatum DESC, k.BelID DESC
+"@
+function Build-Angebote($monate, $fehler) {
+    $head = Page-Head "Solar Dispo - Angebote"
+    $heute = (Get-Date).Date
+    $inhalt = ""; $anzahl = 0
+    if ($fehler) { $inhalt = "<div class='fehler'>Fehler beim Laden der Daten:<br><pre>$(HtmlEncode $fehler)</pre></div>" }
+    else {
+        $termine = Get-Kalender
+        $ang = [ordered]@{}
+        foreach ($r in (Run-Query $SQL_OffeneAngebote @{ "@von" = $heute.AddMonths(-$monate) }).Rows) {
+            $id = [string]$r["BelID"]
+            if (-not $ang.Contains($id)) {
+                $ort = ([string]$r["A1Ort"]).Trim(); if (-not $ort) { $ort = ([string]$r["A0Ort"]).Trim() }
+                $ang[$id] = @{ BelID = $id; Beleg = [string]$r["Beleg"]; Datum = $r["Belegdatum"]; Kunde = ((@(([string]$r["A0Name1"]).Trim(), ([string]$r["A0Name2"]).Trim()) | Where-Object { $_ }) -join ' ')
+                               Name1 = [string]$r["A0Name1"]; Ort = $ort; kWp = 0.0; Module = 0.0; Teile = @{}; AuftragDanach = $(if ($r["AuftragDanach"] -is [System.DBNull]) { "" } else { [string]$r["AuftragDanach"] }) }
+            }
+            $g = $ang[$id]; $gr = [string]$r["Artikelgruppe"]; $m = [double](ToNum $r["Menge"]); $bez = [string]$r["PosBezeichnung"]
+            if ($r["Artikelnummer"] -is [System.DBNull]) { continue }
+            $wp = Modul-Wp $gr $bez; if ($wp) { $g.kWp += $m * $wp / 1000; $g.Module += $m }
+            switch ($gr) {
+                '60' { if ((ToNum $r["Stuecklistentyp"]) -eq 2 -or $bez -match '(?i)batter|speicher|reserva') { $g.Teile['Speicher'] = 1 } else { $g.Teile['Wechselrichter'] = 1 } }
+                '64' { $g.Teile['Wallbox'] = 1 }
+                '12' { if ($bez -match '(?i)flachdach') { $g.Teile['Flachdach'] = 1 } elseif ($bez -match '(?i)steildach') { $g.Teile['Steildach'] = 1 } }
+                '40' { $g.Teile['Mini-PV'] = 1 }
+            }
+        }
+        $anzahl = $ang.Count
+        $rows = foreach ($g in $ang.Values) {
+            $alter = ($heute - ([datetime]$g.Datum).Date).Days
+            $tr = @(Kunden-Termine $g.Name1 $termine | Sort-Object { $_.T.Start })
+            $naechster = @($tr | Where-Object { $_.T.Ende.Date -ge $heute }) | Select-Object -First 1
+            $letzter = @($tr | Where-Object { $_.T.Ende.Date -lt $heute }) | Select-Object -Last 1
+            $terminTxt = if ($naechster) { Termin-Html $naechster $true } elseif ($letzter) { "<span class='leise'>zuletzt</span> " + (Termin-Html $letzter $true) } else { "" }
+            $chips = (@('Wechselrichter', 'Speicher', 'Wallbox', 'Steildach', 'Flachdach', 'Mini-PV') | Where-Object { $g.Teile.ContainsKey($_) } | ForEach-Object { "<span class='chip kein'>$_</span>" }) -join ''
+            $anlage = if ($g.kWp) { "$(Fmt-kWp $g.kWp) <span class='leise'>($(FmtZahl $g.Module) Module)</span>" } else { "" }
+            $stil = if ($g.AuftragDanach) { " style='color:#999'" } else { "" }
+            $hinweis = if ($g.AuftragDanach) { " <span class='chip da' title='Der Kunde hat nach diesem Angebot einen Auftrag erteilt (z.B. &uuml;ber eine andere Variante)'>Auftrag $(HtmlEncode $g.AuftragDanach)</span>" } else { "" }
+            "<tr$stil><td style='white-space:nowrap'>$(([datetime]$g.Datum).ToString('dd.MM.yyyy'))</td><td class='num'>$alter</td><td style='white-space:nowrap'>$(HtmlEncode $g.Beleg)$hinweis</td>" +
+            "<td>$(HtmlEncode $g.Kunde)</td><td>$(HtmlEncode $g.Ort)</td><td style='white-space:nowrap'>$anlage</td><td>$chips</td><td>$terminTxt</td></tr>"
+        }
+        $inhalt = if ($anzahl) {
+            "<table class='filtertab'><thead><tr><th>Datum</th><th class='num'>Tage</th><th>Angebot</th><th>Kunde</th><th>Ort</th><th>Anlage</th><th>Umfang</th><th>Kalender</th></tr></thead><tbody>$($rows -join '')</tbody></table>"
+        } else { "<p class='leise'>Keine offenen Angebote in diesem Zeitraum.</p>" }
+    }
+    $knoepfe = (@(3, 6, 12) | ForEach-Object { $cls = if ($_ -eq $monate) { 'btn' } else { 'btn btn2' }; "<a class='$cls' href='/angebote?monate=$_'>$_ Monate</a>" }) -join ' '
+    return @"
+$head
+<div class='kopf'><h1>Offene Angebote</h1><div class='meta'>$(StandText) &middot; $anzahl Angebote</div></div>
+<div class='steuer'>$knoepfe <input class='suche' id='suche' placeholder='Filtern ...' onkeyup='filter()'></div>
+$(if ($script:KalFehler) { "<div class='hinweisbox'>$(HtmlEncode $script:KalFehler)</div>" })
+$inhalt
+<script>
+function filter(){
+  var q=document.getElementById('suche').value.toLowerCase();
+  document.querySelectorAll('.filtertab tbody tr').forEach(function(tr){ tr.style.display = tr.innerText.toLowerCase().indexOf(q)>-1 ? '' : 'none'; });
+}
+</script>
+</body></html>
+"@
+}
+
 
 # ---------- Dienst ----------
 if ($MyInvocation.InvocationName -eq '.') { return }   # dot-gesourct (Test): nur Funktionen laden
@@ -433,6 +613,15 @@ while ($listener.IsListening) {
             $bel = ([string](Parse-Query $query "bel")) -replace '[^0-9]', ''
             try { $ausgabe = Build-AuftragDetail (@(Get-Auftraege) | Where-Object { $_.BelID -eq $bel } | Select-Object -First 1) $null }
             catch { $ausgabe = Build-AuftragDetail $null ($_.Exception.ToString()) }
+        } elseif ($pfad -eq "/material") {
+            $nur = Parse-Query $query "nur"; if (@('fehlt', 'alle') -notcontains $nur) { $nur = 'fehlt' }
+            $tg = Parse-Query $query "tage"; $tage = if (@('14', '28', '0') -contains $tg) { [int]$tg } else { 28 }
+            try { $ausgabe = Build-Material (Get-Auftraege) $nur $tage $null }
+            catch { $ausgabe = Build-Material @() $nur $tage ($_.Exception.ToString()) }
+        } elseif ($pfad -eq "/angebote") {
+            $mn = Parse-Query $query "monate"; $monate = if (@('3', '6', '12') -contains $mn) { [int]$mn } else { 3 }
+            try { $ausgabe = Build-Angebote $monate $null }
+            catch { $ausgabe = Build-Angebote $monate ($_.Exception.ToString()) }
         } else {
             $response.StatusCode = 404; $ausgabe = "Nicht gefunden"
         }
