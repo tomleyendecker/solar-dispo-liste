@@ -164,7 +164,7 @@ CROSS APPLY (SELECT vp.GGBestellt - ISNULL(res.Menge, 0) AS Menge) soll
 $SQL_OffeneAuftraege = @"
 SELECT k.BelID, k.VorID, k.Belegart, CAST(k.Belegjahr AS varchar) + '-' + CAST(k.Belegnummer AS varchar) AS Beleg, k.Belegdatum,
        k.A0Name1, k.A0Name2, k.A0Strasse, k.A0PLZ, k.A0Ort, k.A1Name1, k.A1Strasse, k.A1PLZ, k.A1Ort,
-       p.Position, p.Artikelnummer, p.Bezeichnung1 AS PosBezeichnung, p.Liefertermin,
+       p.BelPosID, p.Position, p.Artikelnummer, p.Bezeichnung1 AS PosBezeichnung, p.Liefertermin,
        (soll.Menge - vp.GGGeliefert) AS Offen, a.Artikelgruppe, a.Lagerfuehrung, a.Stuecklistentyp, a.Bezeichnung1 AS ArtBezeichnung
 FROM KHKVKBelege k
 INNER JOIN KHKVKBelegePositionen p ON p.BelID = k.BelID AND p.Mandant = k.Mandant
@@ -188,6 +188,17 @@ INNER JOIN KHKVKVorgaengePositionen vp ON vp.VorPosID = p.VorPosID AND vp.Mandan
 $SQL_ResAbzug
 WHERE p.Mandant = $Mandant AND p.PosType = 1 AND p.BelID IN ({BELIDS}) AND soll.Menge > 0
 GROUP BY p.BelID
+"@
+# Alle Positionen eines Auftrags (auch schon gelieferte) fuer die Detailseite
+$SQL_AuftragPositionen = @"
+SELECT p.BelPosID, p.Artikelnummer, p.Bezeichnung1 AS PosBezeichnung, a.Bezeichnung1 AS ArtBezeichnung, a.Artikelgruppe, a.Lagerfuehrung,
+       soll.Menge AS Soll, vp.GGGeliefert AS Geliefert, vp.GGBerechnet AS Berechnet
+FROM KHKVKBelegePositionen p
+INNER JOIN KHKVKVorgaengePositionen vp ON vp.VorPosID = p.VorPosID AND vp.Mandant = p.Mandant
+LEFT JOIN KHKArtikel a ON a.Artikelnummer = p.Artikelnummer AND a.Mandant = p.Mandant
+$SQL_ResAbzug
+WHERE p.Mandant = $Mandant AND p.BelID = @bel AND p.PosType = 1 AND soll.Menge > 0
+ORDER BY p.BelPosID
 "@
 # Lieferscheine und Rechnungen der Vorgaenge (fuer die Detailseite); {VORIDS} = Liste der VorIDs
 $SQL_AuftragFolgebelege = @"
@@ -255,10 +266,10 @@ function Get-Auftraege {
             # Handelsstueckliste (z.B. Speicher): die lagergefuehrten Bestandteile pruefen
             foreach ($k in $stl[$an]) {
                 [void]$au.Material.Add(@{ Gruppe = $gName; Art = [string]$k["Element"]; Bez = [string]$k["Bezeichnung"]; Menge = $menge * [double]$k["Menge"]; KitArt = $an; KitMenge = $menge; KitPos = [string]$r["Position"]
-                                          Lager = ((ToNum $k["Lagerfuehrung"]) -eq -1); Aus = "$an $bez"; Status = ''; Fehl = 0; EkTermin = $null })
+                                          Lager = ((ToNum $k["Lagerfuehrung"]) -eq -1); Aus = "$an $bez"; Status = ''; Fehl = 0; EkTermin = $null; PosID = [string]$r["BelPosID"] })
             }
         } else {
-            [void]$au.Material.Add(@{ Gruppe = $gName; Art = $an; Bez = $bez; Menge = $menge; Lager = ((ToNum $r["Lagerfuehrung"]) -eq -1); Aus = ''; Status = ''; Fehl = 0; EkTermin = $null })
+            [void]$au.Material.Add(@{ Gruppe = $gName; Art = $an; Bez = $bez; Menge = $menge; Lager = ((ToNum $r["Lagerfuehrung"]) -eq -1); Aus = ''; Status = ''; Fehl = 0; EkTermin = $null; PosID = [string]$r["BelPosID"] })
         }
     }
 
@@ -363,6 +374,7 @@ a.artlink:hover { text-decoration:underline; }
 .chip.bestellt { background:#e3f2fd; color:#0d47a1; }
 .chip.fehlt { background:#fdecea; color:#b71c1c; }
 .chip.kein { background:#eceff1; color:#546e7a; }
+tr.erledigt td, tr.erledigt td a.artlink { color:#9aa0a6; }
 </style>
 </head>
 <body>
@@ -446,7 +458,36 @@ function filter(){
 "@
 }
 
-function Build-AuftragDetail($au, $fehler) {
+# Positionen fuer die Auftragsseite: Material (Stuecklisten aufgeloest) und Leistungen, je mit Soll, geliefert, berechnet
+# und dem Status aus der Zuteilung (nur fuer den noch offenen Teil)
+function Get-AuftragPositionen($au) {
+    $t = Run-Query $SQL_AuftragPositionen @{ "@bel" = [int]$au.BelID }
+    $stl = @{}; foreach ($r in (Run-Query $SQL_Stuecklisten $null).Rows) { $k = [string]$r["Stueckliste"]; if (-not $stl.ContainsKey($k)) { $stl[$k] = New-Object System.Collections.ArrayList }; [void]$stl[$k].Add($r) }
+    $mat = New-Object System.Collections.ArrayList; $lei = New-Object System.Collections.ArrayList
+    foreach ($r in $t.Rows) {
+        $an = [string]$r["Artikelnummer"]; $gr = [string]$r["Artikelgruppe"]; $posId = [string]$r["BelPosID"]
+        $bez = ([string]$r["PosBezeichnung"]).Trim(); if (-not $bez) { $bez = [string]$r["ArtBezeichnung"] }
+        $soll = [double](ToNum $r["Soll"]); $gel = [double](ToNum $r["Geliefert"]); $ber = [double](ToNum $r["Berechnet"])
+        if ($LeistungsGruppen -contains $gr -or (-not $MaterialGruppen.Contains($gr) -and (ToNum $r["Lagerfuehrung"]) -ne -1 -and -not $stl.ContainsKey($an))) {
+            [void]$lei.Add(@{ Bez = $bez; Soll = $soll; Gel = $gel; Ber = $ber }); continue
+        }
+        $gName = if ($MaterialGruppen.Contains($gr)) { $MaterialGruppen[$gr] } else { 'Sonstiges' }
+        $teile = if ($stl.ContainsKey($an)) { @($stl[$an] | ForEach-Object { @{ Art = [string]$_["Element"]; Bez = [string]$_["Bezeichnung"]; F = [double]$_["Menge"]; Lager = ((ToNum $_["Lagerfuehrung"]) -eq -1); Aus = "$an $bez" } }) }
+                 else { @(@{ Art = $an; Bez = $bez; F = 1.0; Lager = ((ToNum $r["Lagerfuehrung"]) -eq -1); Aus = '' }) }
+        foreach ($x in $teile) {
+            $offen = @($au.Material | Where-Object { $_.PosID -eq $posId -and $_.Art -eq $x.Art }) | Select-Object -First 1
+            [void]$mat.Add(@{ Gruppe = $gName; Art = $x.Art; Bez = $x.Bez; Aus = $x.Aus; Lager = $x.Lager; Soll = $soll * $x.F; Gel = $gel * $x.F; Ber = $ber * $x.F; Offen = $offen })
+        }
+    }
+    return @{ Material = $mat; Leistungen = $lei }
+}
+# Zelle "geliefert" / "berechnet": - (nichts), Teilmenge, Haken (vollstaendig)
+function Mengen-Zelle($ist, $soll, $wort) {
+    if ($ist -le 1e-9) { return "<td class='num leise'>&ndash;</td>" }
+    if ($ist -ge $soll - 1e-9) { return "<td class='num'><span class='chip da' title='vollst&auml;ndig $wort'>&#10003;</span></td>" }
+    return "<td class='num' title='$(FmtZahl $ist) von $(FmtZahl $soll) $wort'>$(FmtZahl $ist)</td>"
+}
+function Build-AuftragDetail($au, $pos, $fehler) {
     $head = Page-Head "Solar Dispo - Auftrag"
     if ($fehler) { return "$head<div class='fehler'>Fehler beim Laden der Daten:<br><pre>$(HtmlEncode $fehler)</pre></div></body></html>" }
     if (-not $au) { return "$head<p class='leise'>Auftrag nicht gefunden oder nicht mehr offen.</p></body></html>" }
@@ -459,20 +500,30 @@ function Build-AuftragDetail($au, $fehler) {
             "<tr$vergangen><td style='white-space:nowrap'>$zeit$u</td><td>$(($t.Team | ForEach-Object { "<span class='team'>$(HtmlEncode $_)</span>" }) -join '')</td><td>$(HtmlEncode $t.Titel)</td></tr>"
         }) -join '') + "</tbody></table>"
     } else { "<p class='leise'>Im Kalender kein Termin zu diesem Kunden gefunden.</p>" }
-    $material = if ($au.Material.Count) {
-        "<table><thead><tr><th>Gruppe</th><th>Artikel</th><th>Bezeichnung</th><th class='num'>Menge</th><th>Status</th></tr></thead><tbody>" + (($au.Material | ForEach-Object {
-            $st = switch ($_.Status) {
-                'da' { "<span class='chip da'>da</span>" }
-                'bestellt' { "<span class='chip bestellt'>bestellt$(if ($_.EkTermin -is [datetime]) { ' &middot; ' + $_.EkTermin.ToString('dd.MM.') })</span>" }
-                'fehlt' { "<span class='chip fehlt'>fehlt $(FmtZahl $_.Fehl)</span>" }
-                default { "<span class='chip kein'>kein Lagerartikel</span>" }
+    if (-not $pos) { $pos = @{ Material = @(); Leistungen = @() } }
+    $material = if ($pos.Material.Count) {
+        "<table><thead><tr><th>Gruppe</th><th>Artikel</th><th>Bezeichnung</th><th class='num'>Menge</th><th class='num'>Geliefert</th><th class='num'>Berechnet</th><th>Status</th></tr></thead><tbody>" + (($pos.Material | ForEach-Object {
+            $fertig = $_.Gel -ge $_.Soll - 1e-9
+            $st = ""
+            if (-not $fertig) {
+                $o = $_.Offen
+                $st = if (-not $_.Lager) { "<span class='chip kein'>kein Lagerartikel</span>" }
+                      elseif (-not $o) { "" }
+                      else { switch ($o.Status) {
+                          'da' { "<span class='chip da'>da</span>" }
+                          'bestellt' { "<span class='chip bestellt'>bestellt$(if ($o.EkTermin -is [datetime]) { ' &middot; ' + $o.EkTermin.ToString('dd.MM.') })</span>" }
+                          'fehlt' { "<span class='chip fehlt'>fehlt $(FmtZahl $o.Fehl)</span>" }
+                          default { "<span class='chip kein'>kein Lagerartikel</span>" } } }
             }
             $aus = if ($_.Aus) { "<div class='leise'>aus $(HtmlEncode $_.Aus)</div>" } else { "" }
-            "<tr><td>$($_.Gruppe)</td><td><a class='artlink' href='/dispo?art=$(HtmlEncode $_.Art)'>$(HtmlEncode $_.Art)</a></td><td>$(HtmlEncode $_.Bez)$aus</td><td class='num'>$(FmtZahl $_.Menge)</td><td>$st</td></tr>"
+            "<tr$(if ($fertig) { " class='erledigt'" })><td>$($_.Gruppe)</td><td><a class='artlink' href='/dispo?art=$(HtmlEncode $_.Art)'>$(HtmlEncode $_.Art)</a></td><td>$(HtmlEncode $_.Bez)$aus</td>" +
+            "<td class='num'>$(FmtZahl $_.Soll)</td>$(Mengen-Zelle $_.Gel $_.Soll 'geliefert')$(Mengen-Zelle $_.Ber $_.Soll 'berechnet')<td>$st</td></tr>"
         }) -join '') + "</tbody></table>"
     } else { "<p class='leise'>Kein Material im Auftrag.</p>" }
-    $leistungen = if ($au.Leistungen.Count) {
-        "<table><thead><tr><th>Leistung</th><th class='num'>Menge</th></tr></thead><tbody>" + (($au.Leistungen | ForEach-Object { "<tr><td>$(HtmlEncode $_.Bez)</td><td class='num'>$(FmtZahl $_.Menge)</td></tr>" }) -join '') + "</tbody></table>"
+    $leistungen = if ($pos.Leistungen.Count) {
+        "<table><thead><tr><th>Leistung</th><th class='num'>Menge</th><th class='num'>Geliefert</th><th class='num'>Berechnet</th></tr></thead><tbody>" + (($pos.Leistungen | ForEach-Object {
+            "<tr$(if ($_.Gel -ge $_.Soll - 1e-9) { " class='erledigt'" })><td>$(HtmlEncode $_.Bez)</td><td class='num'>$(FmtZahl $_.Soll)</td>$(Mengen-Zelle $_.Gel $_.Soll 'geliefert')$(Mengen-Zelle $_.Ber $_.Soll 'berechnet')</tr>"
+        }) -join '') + "</tbody></table>"
     } else { "<p class='leise'>Keine Leistungen.</p>" }
     $artCls = if ($au.Art -like '*RES*') { 'art res' } else { 'art' }
     $folge = { param($muster)
@@ -1842,8 +1893,10 @@ while ($listener.IsListening) {
             catch { $ausgabe = Build-Auftraege @() ($_.Exception.ToString()) }
         } elseif ($pfad -eq "/auftrag") {
             $bel = ([string](Parse-Query $query "bel")) -replace '[^0-9]', ''
-            try { $ausgabe = Build-AuftragDetail (@(Get-Auftraege) | Where-Object { $_.BelID -eq $bel } | Select-Object -First 1) $null }
-            catch { $ausgabe = Build-AuftragDetail $null ($_.Exception.ToString()) }
+            try {
+                $au = @(Get-Auftraege) | Where-Object { $_.BelID -eq $bel } | Select-Object -First 1
+                $ausgabe = Build-AuftragDetail $au $(if ($au) { Get-AuftragPositionen $au }) $null
+            } catch { $ausgabe = Build-AuftragDetail $null $null ($_.Exception.ToString()) }
         } elseif ($pfad -eq "/material") {
             $nur = Parse-Query $query "nur"; if (@('fehlt', 'alle') -notcontains $nur) { $nur = 'fehlt' }
             $tg = Parse-Query $query "tage"; $tage = if (@('14', '28', '0') -contains $tg) { [int]$tg } else { 28 }
